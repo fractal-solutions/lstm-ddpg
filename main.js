@@ -2,7 +2,7 @@ import { LSTM } from './models/lstm.js';
 import { DDPG } from './models/ddpg.js';
 import { DataProcessor } from './utils/dataProcessor.js';
 
-const INPUT_SIZE = 5;  // OHLCV
+const INPUT_SIZE = 20;  // OHLCV
 const HIDDEN_SIZE = 64;
 const ACTION_SIZE = 3; // [position, sl, tp]
 
@@ -34,19 +34,19 @@ export class ReplayBuffer {
 
   export class TradingSystem {
     constructor() {
-      this.lstm = new LSTM(INPUT_SIZE, HIDDEN_SIZE);
-      this.ddpg = new DDPG(HIDDEN_SIZE, ACTION_SIZE);
-      this.replayBuffer = new ReplayBuffer();
-      this.batchSize = 32;
-      this.gamma = 0.99; // Discount factor
-      this.tau = 0.001; // Soft update parameter
-      
-      // Create target networks
-      this.targetLSTM = new LSTM(INPUT_SIZE, HIDDEN_SIZE);
-      this.targetDDPG = new DDPG(HIDDEN_SIZE, ACTION_SIZE);
-      
-      // Copy initial weights
-      this.updateTargetNetworks(1.0);
+        this.lstm = new LSTM(INPUT_SIZE, HIDDEN_SIZE);
+        this.ddpg = new DDPG(HIDDEN_SIZE, ACTION_SIZE);
+        this.replayBuffer = new ReplayBuffer();
+        this.batchSize = 1024;
+        this.gamma = 0.99; // Discount factor
+        this.tau = 0.001; // Soft update parameter
+        
+        // Create target networks
+        this.targetLSTM = new LSTM(INPUT_SIZE, HIDDEN_SIZE);
+        this.targetDDPG = new DDPG(HIDDEN_SIZE, ACTION_SIZE);
+        
+        // Copy initial weights
+        this.updateTargetNetworks(1.0);
     }
   
     async loadData() {
@@ -56,109 +56,244 @@ export class ReplayBuffer {
     }
   
     predict(state, addNoise = false) {
-      const { hiddenState } = this.lstm.forward(state);
-      let actions = this.ddpg.actorForward(hiddenState);
-      
-      if (addNoise) {
-        // Add exploration noise during training
-        actions = actions.map(a => {
-          const noise = (Math.random() * 2 - 1) * 0.1; // Gaussian noise
-          return Math.max(-1, Math.min(1, a + noise));
-        });
+        // Ensure state is properly normalized
+        console.warn('PREDICTION')
+        if (!Array.isArray(state) || state.some(val => isNaN(val))) {
+          console.log("state: ", state);
+          throw new Error('Invalid state values detected');
+        }
+  
+        const { hiddenState } = this.lstm.forward(state);
+        let actions = this.ddpg.actorForward(hiddenState);
+        console.log("state ",state, "\nactions ",actions);
+        
+        if (addNoise) {
+          // Use Ornstein-Uhlenbeck noise for better exploration
+          actions = actions.map(a => {
+            const theta = 0.15;
+            const sigma = 0.2;
+            const noise = -theta * a + sigma * (Math.random() * 2 - 1);
+            return Math.max(-1, Math.min(1, a + noise)); // Clip between -1 and 1
+          });
+        }
+        
+        // Ensure actions are within valid ranges
+       // Custom position size logic keep between 0.01 and 1
+        let positionSize = actions[0]*10;
+        if (positionSize < 0.01 && positionSize >= 0) {
+            positionSize = 0.01;
+        } else if (positionSize > -0.01 && positionSize < 0) {
+            positionSize = -0.01;
+        } else {
+            positionSize = Math.max(-1, Math.min(1, positionSize));
+            positionSize = positionSize.toFixed(2);
+        }
+        
+        const stopLoss = Math.max(-1, Math.min(1.0, (actions[1]) )); // Convert to 0.1-0.5 range
+        const takeProfit = Math.max(-1, Math.min(1.0, (actions[2]) )); // Convert to 0.2-1.0 range
+        
+        console.log("[position] [SL] [TP]", positionSize,stopLoss,takeProfit);
+
+        return {
+          positionSize,
+          stopLoss,
+          takeProfit,
+          hiddenState
+        };
       }
-      
-      const [positionSize, stopLoss, takeProfit] = actions;
-      return {
-        positionSize,
-        stopLoss,
-        takeProfit,
-        hiddenState
-      };
-    }
   
     calculateReward(action, nextPrice, currentPrice) {
-      const pnl = (nextPrice - currentPrice) * action.positionSize;
-      
-      // Add penalties for excessive risk
-      const slPenalty = Math.abs(action.stopLoss) > 0.5 ? -0.1 : 0;
-      const tpPenalty = Math.abs(action.takeProfit) < 0.2 ? -0.1 : 0;
-      
-      return pnl + slPenalty + tpPenalty;
+        if (isNaN(nextPrice) || isNaN(currentPrice) || isNaN(action.positionSize)) {
+            console.error('Invalid inputs in calculateReward:', { nextPrice, currentPrice, action });
+            return 0;
+        }
+        
+        // Scale price change to reasonable range
+        const priceChange = (nextPrice - currentPrice) / currentPrice;
+        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+        
+        // Calculate scaled PnL
+        const pnl = scaledPriceChange * action.positionSize;
+        
+        // Risk management penalties (scaled)
+        const slPenalty = action.stopLoss < 0.1 ? -0.1 : 
+                         action.stopLoss > 0.5 ? -0.1 : 0;
+        
+        const tpPenalty = action.takeProfit < 0.2 ? -0.1 :
+                         action.takeProfit > 1.0 ? -0.1 : 0;
+        
+        const sizePenalty = Math.abs(action.positionSize) > 0.8 ? -0.05 : 0;
+        
+        // Combine rewards with appropriate scaling
+        const totalReward = pnl + slPenalty + tpPenalty + sizePenalty;
+        
+        return Math.max(-1, Math.min(1, totalReward));
     }
   
+
     async train(epochs = 100, stepsPerEpoch = 1000) {
-      const data = await this.loadData();
-      
-      for (let epoch = 0; epoch < epochs; epoch++) {
+        const data = await this.loadData();
+        this.dataProcessor.normalizeData();
+        console.log(this.dataProcessor.normalized.length);
+        //this.dataProcessor.combineData(this.dataProcessor.normalized);
+
+        
+        let bestReward = -Infinity;
+        let noImprovementCount = 0;
+        const patience = 10; // Number of epochs without improvement before stopping
+    
+        for (let epoch = 0; epoch < epochs; epoch++) {
+            let totalReward = 0;
+            let validSteps = 0;
+            
+            for (let step = 0; step < stepsPerEpoch; step++) {
+                try {
+                    const startIdx = Math.floor(Math.random() * (this.dataProcessor.normalized.length - this.dataProcessor.lookback - 2));
+                    const currentState = this.dataProcessor.getState(startIdx);
+                    console.log("\nSTEP\nstartIdx ", startIdx, "currentState ", currentState.length);
+
+                    const action = this.predict(currentState, false);
+                    const nextState = this.dataProcessor.getState(startIdx + 1);
+
+                    
+                    console.log("price change: ",nextState[nextState.length - 1] - currentState[currentState.length-1]);
+                    const reward = this.calculateReward(
+                        action,
+                        nextState[nextState.length - 1], 
+                        currentState[currentState.length-1]
+                    );
+                    console.log("reward ",reward, "\n\n");
+
+                    if (!isNaN(reward)) {
+                        totalReward += reward;
+                        validSteps++;
+                        
+                        this.replayBuffer.add(
+                            currentState[currentState.length-1],
+                            [action.positionSize, action.stopLoss, action.takeProfit],
+                            reward,
+                            nextState[nextState.length-1],
+                            false
+                        );
+                    }
+
+
+                    
+                    if (this.replayBuffer.buffer.length >= this.batchSize) {
+                        this.replayBuffer.buffer = this.replayBuffer.buffer.slice(-this.batchSize);
+                        const loss = await this.trainStep();
+                        if (step % 1 === 0) {
+                            console.log(`Step ${step}, Loss: ${loss.toFixed(4)}`);
+                        }
+                    }
+                } catch (error) {
+                    console.error(`Error at epoch ${epoch}, step ${step}:`, error);
+                    continue;
+                }
+            }
+            
+            // Validation phase
+            const validationReward = await this.validate();
+            
+            // Early stopping check
+            if (validationReward > bestReward) {
+                bestReward = validationReward;
+                noImprovementCount = 0;
+                await this.saveModels(`best_model`);
+            } else {
+                noImprovementCount++;
+                if (noImprovementCount >= patience) {
+                    console.log(`Early stopping at epoch ${epoch}`);
+                    break;
+                }
+            }
+            const averageReward = validSteps > 0 ? totalReward / validSteps : 0;
+            console.log(`Epoch ${epoch + 1}/${epochs}, Average Reward: ${averageReward.toFixed(4)}, Valid Steps: ${validSteps}`);
+
+            // Save model weights periodically
+            if ((epoch + 1) % 10 === 0) {
+                await this.saveModels(`models_epoch_${epoch + 1}`);
+            }
+        }
+    }
+
+    async validate(steps = 100) {
         let totalReward = 0;
         
-        for (let step = 0; step < stepsPerEpoch; step++) {
-          // Get random starting point
-          const startIdx = Math.floor(Math.random() * (data.length - this.dataProcessor.lookback - 2));
-          
-          // Get current state
-          const currentState = this.dataProcessor.getState(startIdx);
-          
-          // Get action with noise for exploration
-          const action = this.predict(currentState[currentState.length-1], true);
-          
-          // Get next state
-          const nextState = this.dataProcessor.getState(startIdx + 1);
-          
-          // Calculate reward
-          const reward = this.calculateReward(
-            action,
-            data.close[startIdx + 1],
-            data.close[startIdx]
-          );
-          
-          totalReward += reward;
-          
-          // Store experience
-          this.replayBuffer.add(
-            currentState[currentState.length-1],
-            [action.positionSize, action.stopLoss, action.takeProfit],
-            reward,
-            nextState[nextState.length-1],
-            false
-          );
-          
-          // Train if we have enough samples
-          if (this.replayBuffer.buffer.length >= this.batchSize) {
-            await this.trainStep();
+        for (let i = 0; i < steps; i++) {
+            const startIdx = this.getRandomIndex();
+            const state = this.dataProcessor.getState(startIdx);
+            const action = this.predict(state, false); // No noise during validation
+            
+            const reward = this.calculateReward(
+                action,
+                this.dataProcessor.normalized[startIdx + 1][4],
+                this.dataProcessor.normalized[startIdx][4]
+            );
+            
+            if (!isNaN(reward)) {
+                totalReward += reward;
+            }
+        }
+        
+        return totalReward / steps;
+    }
+
+    getRandomIndex() {
+        const min = this.dataProcessor.lookback;
+        const max = this.dataProcessor.normalized.length - 2*(min);
+        const randomNumber = Math.floor(Math.random() * (max - min + 1)) + min;
+        return randomNumber;
+      }
+  
+    async trainStep() {
+        const batch = this.replayBuffer.sample(this.batchSize);
+        let totalLoss = 0;
+        
+        for (const experience of batch) {
+          const { state, action, reward, nextState, done } = experience;
+          try {
+            // Get next action from target networks
+            const nextHiddenState = this.targetLSTM.forward(nextState).hiddenState;
+            const nextAction = this.targetDDPG.actorForward(nextHiddenState);
+            
+            // Calculate target Q-value with clipping
+            const nextQ = this.targetDDPG.criticForward(nextHiddenState, nextAction);
+            const targetQ = reward + (done ? 0 : this.gamma * Math.max(-10, Math.min(10, nextQ)));
+            
+            // Update networks if targetQ is valid
+            if (!isNaN(targetQ)) {
+              // Get current Q-value
+              const { hiddenState } = this.lstm.forward(state);
+              const currentQ = this.ddpg.criticForward(hiddenState, action);
+              
+              // Calculate TD error with clipping
+              const tdError = Math.max(-1, Math.min(1, targetQ - currentQ));
+              
+              // Update networks
+              this.ddpg.updateCritic(tdError);
+              const actorGradient = this.ddpg.getActorGradient(hiddenState);
+              
+              // Clip gradients
+              const clippedGradient = actorGradient.map(g => Math.max(-1, Math.min(1, g)));
+              this.ddpg.updateActor(clippedGradient);
+              
+              // Update LSTM
+              const lstmGradient = this.lstm.backward(tdError);
+              this.lstm.updateWeights(lstmGradient);
+              
+              totalLoss += Math.abs(tdError);
+            }
+          } catch (error) {
+            console.error('Error in training step:', error);
+            continue;
           }
         }
         
-        console.log(`Epoch ${epoch + 1}/${epochs}, Average Reward: ${totalReward / stepsPerEpoch}`);
+        // Soft update target networks
+        this.updateTargetNetworks(this.tau);
         
-        // Save model weights periodically
-        if ((epoch + 1) % 10 === 0) {
-          await this.saveModels(`models_epoch_${epoch + 1}`);
-        }
-      }
-    }
-  
-    async trainStep() {
-      const batch = this.replayBuffer.sample(this.batchSize);
-      
-      // Calculate target Q-values
-      batch.forEach(experience => {
-        const { state, action, reward, nextState, done } = experience;
-        
-        // Get next action from target networks
-        const nextHiddenState = this.targetLSTM.forward(nextState).hiddenState;
-        const nextAction = this.targetDDPG.actorForward(nextHiddenState);
-        
-        // Calculate target Q-value
-        const targetQ = reward + (done ? 0 : this.gamma * 
-          this.targetDDPG.criticForward(nextHiddenState, nextAction));
-        
-        // Update networks
-        this.updateNetworks(state, action, targetQ);
-      });
-      
-      // Soft update target networks
-      this.updateTargetNetworks(this.tau);
+        return totalLoss / batch.length;
     }
   
     updateNetworks(state, action, targetQ) {
@@ -263,7 +398,7 @@ async function main() {
     
     // Training phase
     console.log("Starting training...");
-    await trader.train(100, 1000); // 100 epochs, 1000 steps per epoch
+    await trader.train(100, 100); // 100 epochs, 1000 steps per epoch
     
     // Save final model
     await trader.saveModels('final_model');
@@ -274,7 +409,7 @@ async function main() {
     
     // Example prediction
     const currentState = trader.dataProcessor.getState(25);
-    const prediction = trader.predict(currentState[20]);
+    const prediction = trader.predict(currentState);
     
     console.log('Trading Decision:', prediction);
 }

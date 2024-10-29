@@ -144,6 +144,19 @@ export class LSTM {
         };
     }
 
+    //gradient clipping
+    clipGradients(gradients, clipValue = 1) {
+        const clipGradient = (value) => Math.max(-clipValue, Math.min(clipValue, value));
+        
+        return {
+            ...gradients,
+            Wf: gradients.Wf.map(row => row.map(clipGradient)),
+            Wi: gradients.Wi.map(row => row.map(clipGradient)),
+            Wc: gradients.Wc.map(row => row.map(clipGradient)),
+            Wo: gradients.Wo.map(row => row.map(clipGradient))
+        };
+    }
+
     backward(tdError, learningRate = 0.001) {
         // Initialize gradients for all weights and biases
         const gradients = {
@@ -188,11 +201,11 @@ export class LSTM {
             gradients.bc[i] = dh_next[i];
             gradients.bo[i] = dh_next[i];
         }
-
-        return gradients;
+        //gradients = this.clipGradients(gradients);
+        return this.clipGradients(gradients);
     }
 
-    updateWeights(gradients, learningRate = 0.001) {
+    updateWeights(gradients, learningRate = 0.00001) {
         // Update all weights and biases using the calculated gradients
         const updateMatrix = (target, gradient) => {
             for (let i = 0; i < target.length; i++) {

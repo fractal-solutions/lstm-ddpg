@@ -4,20 +4,26 @@ export class DataProcessor {
       this.lookback = 20; // Previous days for range calculation
       this.dataPoints = 2000;
       this.features = ['open', 'high', 'low', 'close', 'volume'];
+      this.normalized;
+      this.combined;
 
     }
 
     minMaxNormalize(array) {
         let min = Math.min(...array.slice(-this.dataPoints));
         let max = Math.max(...array.slice(-this.dataPoints));
-
-        // Apply min-max normalization to each value
+        // Handle edge case where min equals max
+        if (min === max) {
+            return array.slice(-this.dataPoints).map(() => 0.5); // Return mid-point
+        }
         return array.slice(-this.dataPoints).map(value => (value - min) / (max - min));
     }
 
     combineData(normalizedData) {
         const { open, high, low, close, volume } = normalizedData;
-        return open.map((_, i) => [open[i], high[i], low[i], close[i], volume[i]]);
+        //console.log(normalizedData);
+        this.combined = open.map((_, i) => [open[i], high[i], low[i], close[i], volume[i]]);
+        return this.combined
     }
   
     normalizeData(dataPoints = 2000) {
@@ -46,18 +52,16 @@ export class DataProcessor {
     }
   
     getState(index) {
-      const normalized = this.normalizeData();
-      const points = normalized.slice(normalized.length-1-index,normalized.length-1);
-      const point = normalized[index];
-      //console.log(points);
-      
-      return points
-    //   return [
-    //     point[0],//open
-    //     point[1],//high
-    //     point[2],//low
-    //     point[3],//close
-    //     point[4]//volume
-    //   ];
+        const normalized = this.normalizeData();
+        // Ensure index is within bounds
+        if (index < this.lookback || index >= normalized.length - this.lookback ) {
+            throw new Error(`Index ${index} out of bounds`);
+        }
+        const sliced = normalized.slice(Math.max(0, index - this.lookback), index);
+        let closePrices = [];
+        for (let i = 0; i < this.lookback; i++) {
+            closePrices.push(sliced[i][4]);
+        }
+        return closePrices;
     }
   }
