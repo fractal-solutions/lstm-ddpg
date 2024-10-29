@@ -6,7 +6,7 @@ const INPUT_SIZE = 5;  // OHLCV
 const HIDDEN_SIZE = 64;
 const ACTION_SIZE = 3; // [position, sl, tp]
 
-// First, let's create a new ReplayBuffer class to store experiences:
+//ReplayBuffer class to store experiences:
 
 export class ReplayBuffer {
     constructor(maxSize = 100000) {

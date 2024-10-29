@@ -59,6 +59,17 @@ export class LSTM {
     tanh(x) {
       return Math.tanh(x);
     }
+
+    sigmoidDerivative(x) {
+        const sx = this.sigmoid(x);
+        return sx * (1 - sx);
+    }
+
+    tanhDerivative(x) {
+        const sx = Math.tanh(x);
+        const tx = sx * (1 - sx);
+        return 1 - tx * tx;
+    }
   
     matrixVectorMultiply(matrix, vector) {
       if (!Array.isArray(vector)) {
@@ -133,107 +144,89 @@ export class LSTM {
         };
     }
 
-    sigmoidDerivative(x) {
-        const sx = this.sigmoid(x);
-        return sx * (1 - sx);
-    }
-
-    tanhDerivative(x) {
-        const tx = this.tanh(x);
-        return 1 - tx * tx;
-    }
-
     backward(tdError, learningRate = 0.001) {
-        // Initialize gradients
-        const dWf = Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0));
-        const dWi = Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0));
-        const dWc = Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0));
-        const dWo = Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0));
-        
-        const dUf = Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0));
-        const dUi = Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0));
-        const dUc = Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0));
-        const dUo = Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0));
+        // Initialize gradients for all weights and biases
+        const gradients = {
+            Wf: Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0)),
+            Wi: Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0)),
+            Wc: Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0)),
+            Wo: Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0)),
+            
+            Uf: Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0)),
+            Ui: Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0)),
+            Uc: Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0)),
+            Uo: Array(this.hiddenSize).fill().map(() => Array(this.hiddenSize).fill(0)),
 
-        const dbf = new Array(this.hiddenSize).fill(0);
-        const dbi = new Array(this.hiddenSize).fill(0);
-        const dbc = new Array(this.hiddenSize).fill(0);
-        const dbo = new Array(this.hiddenSize).fill(0);
+            bf: new Array(this.hiddenSize).fill(0),
+            bi: new Array(this.hiddenSize).fill(0),
+            bc: new Array(this.hiddenSize).fill(0),
+            bo: new Array(this.hiddenSize).fill(0)
+        };
 
         // Backpropagate through time
-        let dh_next = tdError;
+        let dh_next = Array.isArray(tdError) ? tdError : new Array(this.hiddenSize).fill(tdError);
         let dc_next = this.activations.cellState.map(this.tanhDerivative);
 
-        // Output gate
-        const do_gate = this.elementWiseMultiply(
-            dh_next,
-            this.activations.cellState.map(this.tanh)
-        );
-
-        // Cell state
-        const dc = this.elementWiseAdd(
-            this.elementWiseMultiply(
-                dh_next,
-                this.elementWiseMultiply(
-                    this.activations.o_gate,
-                    dc_next
-                )
-            ),
-            dc_next
-        );
-
-        // Input gate
-        const di_gate = this.elementWiseMultiply(
-            dc,
-            this.activations.c_tilde
-        );
-
-        // Forget gate
-        const df_gate = this.elementWiseMultiply(
-            dc,
-            this.activations.prevCell
-        );
-
-        // Update weights
+        // Calculate gradients
         for (let i = 0; i < this.hiddenSize; i++) {
             for (let j = 0; j < this.inputSize; j++) {
-                // Input weights
-                dWf[i][j] = df_gate[i] * this.activations.x[j];
-                dWi[i][j] = di_gate[i] * this.activations.x[j];
-                dWc[i][j] = dc[i] * this.activations.x[j];
-                dWo[i][j] = do_gate[i] * this.activations.x[j];
-
-                // Apply updates
-                this.Wf[i][j] -= learningRate * dWf[i][j];
-                this.Wi[i][j] -= learningRate * dWi[i][j];
-                this.Wc[i][j] -= learningRate * dWc[i][j];
-                this.Wo[i][j] -= learningRate * dWo[i][j];
+                gradients.Wf[i][j] = dh_next[i] * this.activations.x[j];
+                gradients.Wi[i][j] = dh_next[i] * this.activations.x[j];
+                gradients.Wc[i][j] = dh_next[i] * this.activations.x[j];
+                gradients.Wo[i][j] = dh_next[i] * this.activations.x[j];
+            }
+            
+            for (let j = 0; j < this.hiddenSize; j++) {
+                gradients.Uf[i][j] = dh_next[i] * this.activations.prevHidden[j];
+                gradients.Ui[i][j] = dh_next[i] * this.activations.prevHidden[j];
+                gradients.Uc[i][j] = dh_next[i] * this.activations.prevHidden[j];
+                gradients.Uo[i][j] = dh_next[i] * this.activations.prevHidden[j];
             }
 
-            // Update biases
-            this.bf[i] -= learningRate * df_gate[i];
-            this.bi[i] -= learningRate * di_gate[i];
-            this.bc[i] -= learningRate * dc[i];
-            this.bo[i] -= learningRate * do_gate[i];
+            gradients.bf[i] = dh_next[i];
+            gradients.bi[i] = dh_next[i];
+            gradients.bc[i] = dh_next[i];
+            gradients.bo[i] = dh_next[i];
         }
+
+        return gradients;
+    }
+
+    updateWeights(gradients, learningRate = 0.001) {
+        // Update all weights and biases using the calculated gradients
+        const updateMatrix = (target, gradient) => {
+            for (let i = 0; i < target.length; i++) {
+                for (let j = 0; j < target[i].length; j++) {
+                    target[i][j] -= learningRate * gradient[i][j];
+                }
+            }
+        };
+
+        const updateVector = (target, gradient) => {
+            for (let i = 0; i < target.length; i++) {
+                target[i] -= learningRate * gradient[i];
+            }
+        };
+
+        // Update input weights
+        updateMatrix(this.Wf, gradients.Wf);
+        updateMatrix(this.Wi, gradients.Wi);
+        updateMatrix(this.Wc, gradients.Wc);
+        updateMatrix(this.Wo, gradients.Wo);
 
         // Update recurrent weights
-        for (let i = 0; i < this.hiddenSize; i++) {
-            for (let j = 0; j < this.hiddenSize; j++) {
-                dUf[i][j] = df_gate[i] * this.activations.prevHidden[j];
-                dUi[i][j] = di_gate[i] * this.activations.prevHidden[j];
-                dUc[i][j] = dc[i] * this.activations.prevHidden[j];
-                dUo[i][j] = do_gate[i] * this.activations.prevHidden[j];
+        updateMatrix(this.Uf, gradients.Uf);
+        updateMatrix(this.Ui, gradients.Ui);
+        updateMatrix(this.Uc, gradients.Uc);
+        updateMatrix(this.Uo, gradients.Uo);
 
-                this.Uf[i][j] -= learningRate * dUf[i][j];
-                this.Ui[i][j] -= learningRate * dUi[i][j];
-                this.Uc[i][j] -= learningRate * dUc[i][j];
-                this.Uo[i][j] -= learningRate * dUo[i][j];
-            }
-        }
+        // Update biases
+        updateVector(this.bf, gradients.bf);
+        updateVector(this.bi, gradients.bi);
+        updateVector(this.bc, gradients.bc);
+        updateVector(this.bo, gradients.bo);
 
+        // Clear activations after update
         this.clearActivations();
-        return dh_next;
     }
 }
-  
