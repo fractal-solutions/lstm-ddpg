@@ -37,7 +37,7 @@ export class ReplayBuffer {
         this.lstm = new LSTM(INPUT_SIZE, HIDDEN_SIZE);
         this.ddpg = new DDPG(HIDDEN_SIZE, ACTION_SIZE);
         this.replayBuffer = new ReplayBuffer();
-        this.batchSize = 1024;
+        this.batchSize = 1000;
         this.gamma = 0.99; // Discount factor
         this.tau = 0.001; // Soft update parameter
         
@@ -65,7 +65,7 @@ export class ReplayBuffer {
   
         const { hiddenState } = this.lstm.forward(state);
         let actions = this.ddpg.actorForward(hiddenState);
-        console.log("state ",state, "\nactions ",actions);
+        //console.log("state ",state, "\nactions ",actions);
         
         if (addNoise) {
           // Use Ornstein-Uhlenbeck noise for better exploration
@@ -79,7 +79,7 @@ export class ReplayBuffer {
         
         // Ensure actions are within valid ranges
        // Custom position size logic keep between 0.01 and 1
-        let positionSize = actions[0]*10;
+        let positionSize = actions[0]*100;
         if (positionSize < 0.01 && positionSize >= 0) {
             positionSize = 0.01;
         } else if (positionSize > -0.01 && positionSize < 0) {
@@ -107,27 +107,34 @@ export class ReplayBuffer {
             console.error('Invalid inputs in calculateReward:', { nextPrice, currentPrice, action });
             return 0;
         }
+        //lower than TP or Entry stoploss for Sell BLOCK
+        else if(action.positionSize < 0 && (action.stopLoss < action.takeProfit || action.stopLoss < 0 || action.takeProfit > 0)) return -5;
         
-        // Scale price change to reasonable range
-        const priceChange = (nextPrice - currentPrice) / currentPrice;
-        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
-        
-        // Calculate scaled PnL
-        const pnl = scaledPriceChange * action.positionSize;
-        
-        // Risk management penalties (scaled)
-        const slPenalty = action.stopLoss < 0.1 ? -0.1 : 
-                         action.stopLoss > 0.5 ? -0.1 : 0;
-        
-        const tpPenalty = action.takeProfit < 0.2 ? -0.1 :
-                         action.takeProfit > 1.0 ? -0.1 : 0;
-        
-        const sizePenalty = Math.abs(action.positionSize) > 0.8 ? -0.05 : 0;
-        
-        // Combine rewards with appropriate scaling
-        const totalReward = pnl + slPenalty + tpPenalty + sizePenalty;
-        
-        return Math.max(-1, Math.min(1, totalReward));
+        //Higher than TP or Entry stoploss for Buy BLOCK
+        else if(action.positionSize > 0 && (action.stopLoss > action.takeProfit || action.stopLoss > 0 || action.takeProfit < 0)) return -5;
+       
+        else {
+            // Scale price change to reasonable range
+            const priceChange = (nextPrice - currentPrice) / currentPrice;
+            const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+            
+            // Calculate scaled PnL
+            const pnl = scaledPriceChange * action.positionSize;
+            
+            // Risk management penalties (scaled)
+            const slPenalty = action.stopLoss < 0.1 ? -0.1 : 
+                            action.stopLoss > 0.5 ? -0.1 : 0;
+            
+            const tpPenalty = action.takeProfit < 0.2 ? -0.1 :
+                            action.takeProfit > 1.0 ? -0.1 : 0;
+            
+            const sizePenalty = Math.abs(action.positionSize) > 0.8 ? -0.05 : 0;
+            
+            // Combine rewards with appropriate scaling
+            const totalReward = pnl + slPenalty + tpPenalty + sizePenalty;
+            
+            return Math.max(-1, Math.min(1, totalReward));
+        }
     }
   
 
@@ -148,31 +155,31 @@ export class ReplayBuffer {
             
             for (let step = 0; step < stepsPerEpoch; step++) {
                 try {
-                    const startIdx = Math.floor(Math.random() * (this.dataProcessor.normalized.length - this.dataProcessor.lookback - 2));
+                    const startIdx = this.getRandomIndex();//Math.floor(Math.random() * (this.dataProcessor.normalized.length - this.dataProcessor.lookback - 2));
                     const currentState = this.dataProcessor.getState(startIdx);
-                    console.log("\nSTEP\nstartIdx ", startIdx, "currentState ", currentState.length);
+                    console.log("\nSTEP\nstartIdx ", startIdx); //, "currentState ", currentState.length);
 
-                    const action = this.predict(currentState, false);
+                    const action = this.predict(currentState, true);
                     const nextState = this.dataProcessor.getState(startIdx + 1);
 
                     
-                    console.log("price change: ",nextState[nextState.length - 1] - currentState[currentState.length-1]);
+                    //console.log("price change: ",nextState[nextState.length - 1] - currentState[currentState.length-1]);
                     const reward = this.calculateReward(
                         action,
                         nextState[nextState.length - 1], 
                         currentState[currentState.length-1]
                     );
-                    console.log("reward ",reward, "\n\n");
+                    console.log('step: ',step," reward: ",reward, "\n\n");
 
                     if (!isNaN(reward)) {
                         totalReward += reward;
                         validSteps++;
                         
                         this.replayBuffer.add(
-                            currentState[currentState.length-1],
+                            currentState,
                             [action.positionSize, action.stopLoss, action.takeProfit],
                             reward,
-                            nextState[nextState.length-1],
+                            nextState,
                             false
                         );
                     }
@@ -183,11 +190,13 @@ export class ReplayBuffer {
                         this.replayBuffer.buffer = this.replayBuffer.buffer.slice(-this.batchSize);
                         const loss = await this.trainStep();
                         if (step % 1 === 0) {
-                            console.log(`Step ${step}, Loss: ${loss.toFixed(4)}`);
+                            console.log(`Epoch ${epoch}, Step ${step}, Loss: ${loss.toFixed(4)}`);
+                            //await Bun.sleep(2000);
                         }
                     }
                 } catch (error) {
                     console.error(`Error at epoch ${epoch}, step ${step}:`, error);
+                    
                     continue;
                 }
             }
@@ -203,13 +212,14 @@ export class ReplayBuffer {
             } else {
                 noImprovementCount++;
                 if (noImprovementCount >= patience) {
-                    console.log(`Early stopping at epoch ${epoch}`);
+                    console.log(`\n\n~Early stopping at epoch ${epoch}\n\n`);
                     break;
                 }
             }
             const averageReward = validSteps > 0 ? totalReward / validSteps : 0;
             console.log(`Epoch ${epoch + 1}/${epochs}, Average Reward: ${averageReward.toFixed(4)}, Valid Steps: ${validSteps}`);
-
+            
+            await Bun.sleep(2000);
             // Save model weights periodically
             if ((epoch + 1) % 10 === 0) {
                 await this.saveModels(`models_epoch_${epoch + 1}`);
@@ -254,6 +264,7 @@ export class ReplayBuffer {
           const { state, action, reward, nextState, done } = experience;
           try {
             // Get next action from target networks
+            //console.log("trainingStep next state: ", nextState);
             const nextHiddenState = this.targetLSTM.forward(nextState).hiddenState;
             const nextAction = this.targetDDPG.actorForward(nextHiddenState);
             
@@ -397,21 +408,26 @@ async function main() {
     const trader = new TradingSystem();
     
     // Training phase
-    console.log("Starting training...");
-    await trader.train(100, 100); // 100 epochs, 1000 steps per epoch
+    console.log("\nStarting training...");
+    await trader.train(100, 1000); // 100 epochs, 1000 steps per epoch
     
     // Save final model
     await trader.saveModels('final_model');
     
     // Testing phase
-    console.log("Testing model...");
+    console.log("\nTesting model...");
     const data = await trader.loadData();
     
     // Example prediction
-    const currentState = trader.dataProcessor.getState(25);
-    const prediction = trader.predict(currentState);
-    
-    console.log('Trading Decision:', prediction);
+    for(let i = 24; i < 32; i++) {
+        const currentState = trader.dataProcessor.getState(i);
+
+        const prediction = trader.predict(currentState);
+        
+        console.log('Trading Decision: Position/Dir[', prediction.positionSize,'] SL[', prediction.stopLoss,'] TP[', prediction.takeProfit,']');
+        const nextState = trader.dataProcessor.getState(i+1);
+        console.log('price change: ', nextState[nextState.length-1] - currentState[currentState.length-1],'\n');
+    }
 }
   
 main().catch(console.error);

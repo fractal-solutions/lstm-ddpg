@@ -11,36 +11,38 @@ export class DDPG {
     }
     
     initializeNetworks() {
-        // Actor network weights
+        // Actor network weights with smaller initial values
         this.actorWeights = {
-            layer1: this.createMatrix(64, this.stateSize),
-            layer2: this.createMatrix(32, 64),
-            output: this.createMatrix(this.actionSize, 32)
+            layer1: this.createMatrix(64, this.stateSize, 0.1),
+            layer2: this.createMatrix(32, 64, 0.1),
+            output: this.createMatrix(this.actionSize, 32, 0.1)
         };
         
-        // Critic network weights
+        // Critic network weights with smaller initial values
         this.criticWeights = {
-            stateLayer: this.createMatrix(64, this.stateSize),
-            actionLayer: this.createMatrix(64, this.actionSize),
-            hidden: this.createMatrix(32, 128),
-            output: this.createMatrix(1, 32)
+            stateLayer: this.createMatrix(64, this.stateSize, 0.1),
+            actionLayer: this.createMatrix(64, this.actionSize, 0.1),
+            hidden: this.createMatrix(32, 128, 0.1),
+            output: this.createMatrix(1, 32, 0.1)
         };
     }
     
-    createMatrix(rows, cols) {
+    createMatrix(rows, cols, scale = 0.1) {
         return Array.from({ length: rows }, () =>
             Array.from({ length: cols }, () =>
-                (Math.random() * 2 - 1) * Math.sqrt(2 / (rows + cols))
+                (Math.random() * 2 - 1) * scale
             )
         );
     }
     
     relu(x) {
-        return Math.max(0, x);
+        return Math.max(0, Math.min(10, x)); // Clipped ReLU to prevent explosion
     }
     
     tanh(x) {
-        return Math.tanh(x);
+        // Clip input to prevent NaN
+        const clipped = Math.max(-20, Math.min(20, x));
+        return Math.tanh(clipped);
     }
     
     matrixMultiply(matrix, vector) {
@@ -52,16 +54,19 @@ export class DDPG {
             throw new Error('Matrix and vector must be arrays');
         }
         
-        // Convert vector to array if it's not already
         const inputVector = Array.isArray(vector) ? vector : Array.from(vector);
         
         if (matrix[0].length !== inputVector.length) {
             throw new Error(`Matrix columns (${matrix[0].length}) must match vector length (${inputVector.length})`);
         }
         
-        return matrix.map(row =>
-            row.reduce((sum, val, i) => sum + val * inputVector[i], 0)
-        );
+        return matrix.map(row => {
+            const sum = row.reduce((sum, val, i) => {
+                const product = val * inputVector[i];
+                return sum + (isNaN(product) ? 0 : product); // Handle NaN values
+            }, 0);
+            return Math.max(-10, Math.min(10, sum)); // Clip output
+        });
     }
     
     actorForward(state) {
@@ -86,6 +91,12 @@ export class DDPG {
         // Output layer
         const output = this.matrixMultiply(this.actorWeights.output, layer2)
             .map(x => this.tanh(x));
+
+        // Validate output
+        if (output.some(isNaN)) {
+            console.error('NaN detected in actor output');
+            return Array(this.actionSize).fill(0); // Safe fallback
+        }            
         
         return output;
     }
@@ -124,16 +135,20 @@ export class DDPG {
         // Output layer
         const output = this.matrixMultiply(this.criticWeights.output, hidden)[0];
         
-        return output;
+        return isNaN(output) ? 0 : Math.max(-10, Math.min(10, output));
     }
     
     updateCritic(tdError) {
-        const learningRate = 0.001;
+        const learningRate = 0.0001; // Reduced learning rate
+        const clippedError = Math.max(-1, Math.min(1, tdError));
         
-        // Update critic weights using TD error
+        // Update critic weights using clipped TD error
         Object.keys(this.criticWeights).forEach(layer => {
             this.criticWeights[layer] = this.criticWeights[layer].map(row =>
-                row.map(weight => weight + learningRate * tdError)
+                row.map(weight => {
+                    const update = weight + learningRate * clippedError;
+                    return Math.max(-1, Math.min(1, update)); // Clip weights
+                })
             );
         });
     }
@@ -155,9 +170,10 @@ export class DDPG {
         const actions = this.actorForward(flatState);
         const criticValue = this.criticForward(flatState, actions);
         
-        // Calculate gradient of critic with respect to actions
+        // Calculate gradient with clipping
         const actionGradient = actions.map(action => {
-            return criticValue * (1 - action * action); // derivative of tanh
+            const grad = criticValue * (1 - action * action); // derivative of tanh
+            return Math.max(-1, Math.min(1, grad)); // Clip gradient
         });
         
         return actionGradient;
@@ -168,12 +184,15 @@ export class DDPG {
             throw new Error('Gradient must be an array');
         }
         
-        const learningRate = 0.0001;
-        
-        // Update actor weights using policy gradient
+        const learningRate = 0.00001; // Reduced learning rate
+        // Update actor weights using clipped policy gradient
         Object.keys(this.actorWeights).forEach(layer => {
             this.actorWeights[layer] = this.actorWeights[layer].map(row =>
-                row.map(weight => weight + learningRate * gradient)
+                row.map(weight => {
+                    const clippedGrad = Math.max(-1, Math.min(1, gradient[0]));
+                    const update = weight + learningRate * clippedGrad;
+                    return Math.max(-1, Math.min(1, update)); // Clip weights
+                })
             );
         });
     }

@@ -145,7 +145,7 @@ export class LSTM {
     }
 
     //gradient clipping
-    clipGradients(gradients, clipValue = 1) {
+    clipGradients(gradients, clipValue = 0.9) {
         const clipGradient = (value) => Math.max(-clipValue, Math.min(clipValue, value));
         
         return {
