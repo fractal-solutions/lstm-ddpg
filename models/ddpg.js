@@ -139,7 +139,7 @@ export class DDPG {
     }
     
     updateCritic(tdError) {
-        const learningRate = 0.0001; // Reduced learning rate
+        const learningRate = 0.001; // Reduced learning rate
         const clippedError = Math.max(-1, Math.min(1, tdError));
         
         // Update critic weights using clipped TD error
@@ -184,7 +184,7 @@ export class DDPG {
             throw new Error('Gradient must be an array');
         }
         
-        const learningRate = 0.00001; // Reduced learning rate
+        const learningRate = 0.0001; // Reduced learning rate
         // Update actor weights using clipped policy gradient
         Object.keys(this.actorWeights).forEach(layer => {
             this.actorWeights[layer] = this.actorWeights[layer].map(row =>

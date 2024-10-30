@@ -41,9 +41,11 @@ export class DataProcessor {
     }
   
     calculateRange(window) {
-      const highs = window.map(d => d.high);
-      const lows = window.map(d => d.low);
-      return Math.max(...highs) - Math.min(...lows);
+      //console.log(window);
+      //const highs = window.map(d => d.high);
+      //const lows = window.map(d => d.low);
+      if (window)return Math.max(...window) - Math.min(...window);
+      else return 0;
     }
   
     calculateVolumeMA(window) {
@@ -51,7 +53,7 @@ export class DataProcessor {
       return volumes.reduce((a, b) => a + b, 0) / window.length;
     }
   
-    getState(index) {
+    async getState(index) {
         const normalized = this.normalizeData();
         // Ensure index is within bounds
         if (index < this.lookback || index >= normalized.length - this.lookback ) {

@@ -50,7 +50,7 @@ export class ReplayBuffer {
     }
   
     async loadData() {
-      const data = await Bun.file('./data/EURUSD_H1.json').json();
+      const data = await Bun.file('./data/EURUSD_D1.json').json();
       this.dataProcessor = new DataProcessor(data);
       return data;
     }
@@ -102,24 +102,66 @@ export class ReplayBuffer {
         };
       }
   
-    calculateReward(action, nextPrice, currentPrice) {
+    calculateReward(action, nextPrice, currentPrice, index, currentState) {
         if (isNaN(nextPrice) || isNaN(currentPrice) || isNaN(action.positionSize)) {
             console.error('Invalid inputs in calculateReward:', { nextPrice, currentPrice, action });
             return 0;
         }
         //lower than TP or Entry stoploss for Sell BLOCK
-        else if(action.positionSize < 0 && (action.stopLoss < action.takeProfit || action.stopLoss < 0 || action.takeProfit > 0)) return -5;
+        else if(action.positionSize < 0 && (action.stopLoss < action.takeProfit || action.stopLoss < 0 || action.takeProfit > 0)) {
+            console.log("INVALID TRADE");
+            return -0.5;
+        }
         
         //Higher than TP or Entry stoploss for Buy BLOCK
-        else if(action.positionSize > 0 && (action.stopLoss > action.takeProfit || action.stopLoss > 0 || action.takeProfit < 0)) return -5;
+        else if(action.positionSize > 0 && (action.stopLoss > action.takeProfit || action.stopLoss > 0 || action.takeProfit < 0)) {
+            console.log("INVALID TRADE");
+            return -0.5;
+        }
        
         else {
-            // Scale price change to reasonable range
-            const priceChange = (nextPrice - currentPrice) / currentPrice;
-            const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+            const checkStoploss = (indx) => {
+                const newCandle = this.dataProcessor.normalized[indx+1]; //o,h,l,c,v
+                const range = this.dataProcessor.calculateRange(currentState);
+                console.log("range ",range)
+                const sl = action.positionSize > 0 ? 
+                            (- range * Math.sqrt(action.stopLoss*action.stopLoss))+currentPrice : 
+                            (range * Math.sqrt(action.stopLoss*action.stopLoss))+currentPrice;
+                const tp = action.positionSize > 0 ? 
+                            (range * Math.sqrt(action.takeProfit*action.takeProfit))+currentPrice : 
+                            (-range * Math.sqrt(action.takeProfit*action.takeProfit))+currentPrice;
+                console.log("Entry: ",currentPrice," ExitClose: ", newCandle ? newCandle[3]: 0," SL: ",sl," TP: ",tp);
+                if (action.positionSize > 0 && newCandle) { //BUY
+                    if (newCandle[2] < sl) return -1;//if newCandle low is lower than SL
+                    if (newCandle[1] > tp || newCandle[3] > tp ) {//TP is hit
+                        console.log("TP HIT");
+                        const priceChange = (tp - currentPrice) / currentPrice;
+                        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                        const reward = scaledPriceChange * action.positionSize;
+                        return reward;
+                    }
+                } else if (action.positionSize < 0 && newCandle) { //SELL
+                    if (newCandle[1] > sl) return -1; //if newCandle High is higher than SL
+                    if (newCandle[2] < tp || newCandle[3] < tp ) {//TP is Hit
+                        console.log("TP HIT");
+                        const priceChange = (currentPrice - tp) / currentPrice;
+                        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                        const reward = (2*scaledPriceChange) * action.positionSize;
+                        return reward;
+                    }
+                } else {
+                    // Scale price change to reasonable range
+                    console.log("FLOATING PROFIT");
+                    const priceChange = (nextPrice - currentPrice) / currentPrice;
+                    const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                    
+                    // Calculate scaled PnL
+                    const pnl = scaledPriceChange * action.positionSize;
+                    return pnl;
+                }
+            }
+            const pnl = checkStoploss(index);
             
-            // Calculate scaled PnL
-            const pnl = scaledPriceChange * action.positionSize;
             
             // Risk management penalties (scaled)
             const slPenalty = action.stopLoss < 0.1 ? -0.1 : 
@@ -133,7 +175,7 @@ export class ReplayBuffer {
             // Combine rewards with appropriate scaling
             const totalReward = pnl + slPenalty + tpPenalty + sizePenalty;
             
-            return Math.max(-1, Math.min(1, totalReward));
+            return Math.max(-1, Math.min(2, totalReward));
         }
     }
   
@@ -147,7 +189,7 @@ export class ReplayBuffer {
         
         let bestReward = -Infinity;
         let noImprovementCount = 0;
-        const patience = 10; // Number of epochs without improvement before stopping
+        const patience = 20; // Number of epochs without improvement before stopping
     
         for (let epoch = 0; epoch < epochs; epoch++) {
             let totalReward = 0;
@@ -167,7 +209,9 @@ export class ReplayBuffer {
                     const reward = this.calculateReward(
                         action,
                         nextState[nextState.length - 1], 
-                        currentState[currentState.length-1]
+                        currentState[currentState.length-1],
+                        startIdx,
+                        currentState
                     );
                     console.log('step: ',step," reward: ",reward, "\n\n");
 
@@ -219,7 +263,7 @@ export class ReplayBuffer {
             const averageReward = validSteps > 0 ? totalReward / validSteps : 0;
             console.log(`Epoch ${epoch + 1}/${epochs}, Average Reward: ${averageReward.toFixed(4)}, Valid Steps: ${validSteps}`);
             
-            await Bun.sleep(2000);
+            //await Bun.sleep(2000);
             // Save model weights periodically
             if ((epoch + 1) % 10 === 0) {
                 await this.saveModels(`models_epoch_${epoch + 1}`);
@@ -409,7 +453,7 @@ async function main() {
     
     // Training phase
     console.log("\nStarting training...");
-    await trader.train(100, 1000); // 100 epochs, 1000 steps per epoch
+    await trader.train(100, 100); // 100 epochs, 1000 steps per epoch
     
     // Save final model
     await trader.saveModels('final_model');
@@ -417,15 +461,16 @@ async function main() {
     // Testing phase
     console.log("\nTesting model...");
     const data = await trader.loadData();
+    console.log("data length ", data.open.length);
+    await Bun.sleep(3000);
     
     // Example prediction
-    for(let i = 24; i < 32; i++) {
+    for(let i = 24; i < 96; i++) {
         const currentState = trader.dataProcessor.getState(i);
-
         const prediction = trader.predict(currentState);
-        
+        const nextState = await trader.dataProcessor.getState(i+1);
+
         console.log('Trading Decision: Position/Dir[', prediction.positionSize,'] SL[', prediction.stopLoss,'] TP[', prediction.takeProfit,']');
-        const nextState = trader.dataProcessor.getState(i+1);
         console.log('price change: ', nextState[nextState.length-1] - currentState[currentState.length-1],'\n');
     }
 }

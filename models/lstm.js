@@ -205,7 +205,7 @@ export class LSTM {
         return this.clipGradients(gradients);
     }
 
-    updateWeights(gradients, learningRate = 0.00001) {
+    updateWeights(gradients, learningRate = 0.001) {
         // Update all weights and biases using the calculated gradients
         const updateMatrix = (target, gradient) => {
             for (let i = 0; i < target.length; i++) {
