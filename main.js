@@ -50,13 +50,14 @@ export class ReplayBuffer {
     }
   
     async loadData() {
-      const data = await Bun.file('./data/EURUSD_D1.json').json();
+      const data = await Bun.file('./data/EURUSD_M15.json').json();
       this.dataProcessor = new DataProcessor(data);
       return data;
     }
   
     predict(state, addNoise = false) {
         // Ensure state is properly normalized
+        //console.log(state);
         console.warn('PREDICTION')
         if (!Array.isArray(state) || state.some(val => isNaN(val))) {
           console.log("state: ", state);
@@ -132,7 +133,10 @@ export class ReplayBuffer {
                             (-range * Math.sqrt(action.takeProfit*action.takeProfit))+currentPrice;
                 console.log("Entry: ",currentPrice," ExitClose: ", newCandle ? newCandle[3]: 0," SL: ",sl," TP: ",tp);
                 if (action.positionSize > 0 && newCandle) { //BUY
-                    if (newCandle[2] < sl) return -1;//if newCandle low is lower than SL
+                    if (newCandle[2] < sl) {
+                        console.log("SL HIT");
+                        return -1;
+                    }//if newCandle low is lower than SL
                     if (newCandle[1] > tp || newCandle[3] > tp ) {//TP is hit
                         console.log("TP HIT");
                         const priceChange = (tp - currentPrice) / currentPrice;
@@ -141,7 +145,10 @@ export class ReplayBuffer {
                         return reward;
                     }
                 } else if (action.positionSize < 0 && newCandle) { //SELL
-                    if (newCandle[1] > sl) return -1; //if newCandle High is higher than SL
+                    if (newCandle[1] > sl) {
+                        console.log("SL HIT");
+                        return -1;
+                    } //if newCandle High is higher than SL
                     if (newCandle[2] < tp || newCandle[3] < tp ) {//TP is Hit
                         console.log("TP HIT");
                         const priceChange = (currentPrice - tp) / currentPrice;
@@ -198,11 +205,11 @@ export class ReplayBuffer {
             for (let step = 0; step < stepsPerEpoch; step++) {
                 try {
                     const startIdx = this.getRandomIndex();//Math.floor(Math.random() * (this.dataProcessor.normalized.length - this.dataProcessor.lookback - 2));
-                    const currentState = this.dataProcessor.getState(startIdx);
+                    const currentState = await this.dataProcessor.getState(startIdx);
                     console.log("\nSTEP\nstartIdx ", startIdx); //, "currentState ", currentState.length);
 
                     const action = this.predict(currentState, true);
-                    const nextState = this.dataProcessor.getState(startIdx + 1);
+                    const nextState = await this.dataProcessor.getState(startIdx + 1);
 
                     
                     //console.log("price change: ",nextState[nextState.length - 1] - currentState[currentState.length-1]);
@@ -276,7 +283,7 @@ export class ReplayBuffer {
         
         for (let i = 0; i < steps; i++) {
             const startIdx = this.getRandomIndex();
-            const state = this.dataProcessor.getState(startIdx);
+            const state = await this.dataProcessor.getState(startIdx);
             const action = this.predict(state, false); // No noise during validation
             
             const reward = this.calculateReward(

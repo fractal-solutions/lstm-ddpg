@@ -10,6 +10,7 @@ export class DataProcessor {
     }
 
     minMaxNormalize(array) {
+        //slice array according to required data points before normalizing
         let min = Math.min(...array.slice(-this.dataPoints));
         let max = Math.max(...array.slice(-this.dataPoints));
         // Handle edge case where min equals max
@@ -61,9 +62,11 @@ export class DataProcessor {
         }
         const sliced = normalized.slice(Math.max(0, index - this.lookback), index);
         let closePrices = [];
+        
         for (let i = 0; i < this.lookback; i++) {
             closePrices.push(sliced[i][4]);
         }
+        //console.log(closePrices);
         return closePrices;
     }
   }
