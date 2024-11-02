@@ -144,7 +144,11 @@ export class ReplayBuffer {
                 if (action.positionSize > 0 && newCandle) { //BUY
                     if (/*newCandle[2]*/ Math.min(...tradeLows) < sl) {
                         console.log("SL HIT");
-                        return -1* Math.sqrt(action.positionSize*action.positionSize);
+                        const priceChange = (sl - currentPrice) / currentPrice;
+                        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                        const reward = (scaledPriceChange) * action.positionSize;
+                        return reward;
+                        //return -1* Math.sqrt(action.positionSize*action.positionSize);
                     }//if newCandle low is lower than SL
                     if (/*newCandle[1]*/ Math.max(...tradeHighs) > tp || newCandle[3] > tp ) {//TP is hit
                         console.log("TP HIT");
@@ -156,7 +160,11 @@ export class ReplayBuffer {
                 } else if (action.positionSize < 0 && newCandle) { //SELL
                     if (Math.max(...tradeHighs) > sl) {
                         console.log("SL HIT");
-                        return -1* Math.sqrt(action.positionSize*action.positionSize);
+                        const priceChange = (sl - currentPrice) / currentPrice;
+                        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                        const reward = (scaledPriceChange) * action.positionSize;
+                        return reward;
+                        // return -1* Math.sqrt(action.positionSize*action.positionSize);
                     } //if newCandle High is higher than SL
                     if (Math.min(...tradeLows) < tp || newCandle[3] < tp ) {//TP is Hit
                         console.log("TP HIT");
@@ -168,22 +176,22 @@ export class ReplayBuffer {
                 } else {
                     // Scale price change to reasonable range
                     console.log("FLOATING PROFIT");
-                    const priceChange = (nextPrice - currentPrice) / currentPrice;
+                    const priceChange = (currentPrice - nextPrice) / currentPrice;
                     const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
                     
                     // Calculate scaled PnL
-                    const pnl = (scaledPriceChange) * action.positionSize;
-                    return pnl;
+                    const reward = (scaledPriceChange) * action.positionSize;
+                    return reward;
                 }
             }
             const pnl = checkStoploss(index);
             
             
             // Risk management penalties (scaled)
-            const slPenalty = action.stopLoss < 0.1 ? -0.1 : 
+            const slPenalty = action.stopLoss < 0.03 ? -0.1 : 
                             action.stopLoss > 0.5 ? -0.1 : 0;
             
-            const tpPenalty = action.takeProfit < 0.2 ? -0.1 :
+            const tpPenalty = action.takeProfit < 0.05 ? -0.1 :
                             action.takeProfit > 1.0 ? -0.1 : 0;
             
             const sizePenalty = Math.abs(action.positionSize) > 0.8 ? -0.05 : 0;

@@ -1,7 +1,7 @@
 export class DataProcessor {
     constructor(data) {
       this.data = data;
-      this.lookback = 20; // Previous days for range calculation
+      this.lookback = 60; // Previous days for range calculation
       this.dataPoints = 4000;
       this.features = ['open', 'high', 'low', 'close', 'volume'];
       this.normalized;
