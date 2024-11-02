@@ -81,7 +81,7 @@ export class ReplayBuffer {
         
         // Ensure actions are within valid ranges
        // Custom position size logic keep between 0.01 and 1
-        let positionSize = actions[0]*100;
+        let positionSize = actions[0]*10;
         if (positionSize < 0.01 && positionSize >= 0) {
             positionSize = 0.01;
         } else if (positionSize > -0.01 && positionSize < 0) {
