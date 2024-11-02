@@ -170,7 +170,7 @@ export class ReplayBuffer {
                         console.log("TP HIT");
                         const priceChange = (currentPrice - tp) / currentPrice;
                         const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
-                        const reward = (scaledPriceChange) * action.positionSize;
+                        const reward = (scaledPriceChange) * Math.sqrt(action.positionSize * action.positionSize);
                         return reward;
                     }
                 } else {
