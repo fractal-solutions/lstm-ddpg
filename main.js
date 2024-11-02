@@ -51,7 +51,7 @@ export class ReplayBuffer {
     }
   
     async loadData() {
-      const data = await Bun.file('./data/EURUSD_M15.json').json();
+      const data = await Bun.file('./data/EURUSD_D1.json').json();
       this.dataProcessor = new DataProcessor(data);
       return data;
     }
@@ -81,7 +81,7 @@ export class ReplayBuffer {
         
         // Ensure actions are within valid ranges
        // Custom position size logic keep between 0.01 and 1
-        let positionSize = actions[0]*10;
+        let positionSize = actions[0]*50;
         if (positionSize < 0.01 && positionSize >= 0) {
             positionSize = 0.01;
         } else if (positionSize > -0.01 && positionSize < 0) {
@@ -123,38 +123,46 @@ export class ReplayBuffer {
        
         else {
             const checkStoploss = (indx) => {
-                const newCandle = this.dataProcessor.normalized[indx + this.barsPredicted]; //o,h,l,c,v
+                const newCandle = this.dataProcessor.normalized[indx + this.barsPredicted - 1]; //o,h,l,c,v
                 const range = this.dataProcessor.calculateRange(currentState);
                 console.log("range ",range)
                 const sl = action.positionSize > 0 ? 
-                            (- range * Math.sqrt(action.stopLoss*action.stopLoss))+currentPrice : 
-                            (range * Math.sqrt(action.stopLoss*action.stopLoss))+currentPrice;
+                            currentPrice - (range * Math.sqrt(action.stopLoss*action.stopLoss)) : 
+                            currentPrice + (range * Math.sqrt(action.stopLoss*action.stopLoss));
                 const tp = action.positionSize > 0 ? 
-                            (range * Math.sqrt(action.takeProfit*action.takeProfit))+currentPrice : 
-                            (-range * Math.sqrt(action.takeProfit*action.takeProfit))+currentPrice;
-                console.log("Entry: ",currentPrice," ExitClose: ", newCandle ? newCandle[3]: 0," SL: ",sl," TP: ",tp);
+                            currentPrice + (range * Math.sqrt(action.takeProfit*action.takeProfit)) : 
+                            currentPrice - (range * Math.sqrt(action.takeProfit*action.takeProfit));
+
+                let tradeHighs= [], tradeLows = [], tradeHigh, tradeLow;
+                for (let i = indx; i < indx + this.barsPredicted; i++) {
+                  tradeHighs.push(this.dataProcessor.normalized[i][1] );
+                  tradeLows.push(this.dataProcessor.normalized[i][2]);
+                  
+                }
+                console.log("trade bounds(H,L): \n", tradeHighs,"\n", tradeLows);
+                console.log("Entry: ",currentPrice," LastClose: ", newCandle ? newCandle[3]: 0," SL: ",sl," TP: ",tp);
                 if (action.positionSize > 0 && newCandle) { //BUY
-                    if (newCandle[2] < sl) {
+                    if (/*newCandle[2]*/ Math.min(...tradeLows) < sl) {
                         console.log("SL HIT");
-                        return -1;
+                        return -1* Math.sqrt(action.positionSize*action.positionSize);
                     }//if newCandle low is lower than SL
-                    if (newCandle[1] > tp || newCandle[3] > tp ) {//TP is hit
+                    if (/*newCandle[1]*/ Math.max(...tradeHighs) > tp || newCandle[3] > tp ) {//TP is hit
                         console.log("TP HIT");
                         const priceChange = (tp - currentPrice) / currentPrice;
                         const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
-                        const reward = scaledPriceChange * action.positionSize;
+                        const reward = (scaledPriceChange) * action.positionSize;
                         return reward;
                     }
                 } else if (action.positionSize < 0 && newCandle) { //SELL
-                    if (newCandle[1] > sl) {
+                    if (Math.max(...tradeHighs) > sl) {
                         console.log("SL HIT");
-                        return -1;
+                        return -1* Math.sqrt(action.positionSize*action.positionSize);
                     } //if newCandle High is higher than SL
-                    if (newCandle[2] < tp || newCandle[3] < tp ) {//TP is Hit
+                    if (Math.min(...tradeLows) < tp || newCandle[3] < tp ) {//TP is Hit
                         console.log("TP HIT");
                         const priceChange = (currentPrice - tp) / currentPrice;
                         const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
-                        const reward = (2*scaledPriceChange) * action.positionSize;
+                        const reward = (scaledPriceChange) * action.positionSize;
                         return reward;
                     }
                 } else {
@@ -164,7 +172,7 @@ export class ReplayBuffer {
                     const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
                     
                     // Calculate scaled PnL
-                    const pnl = scaledPriceChange * action.positionSize;
+                    const pnl = (scaledPriceChange) * action.positionSize;
                     return pnl;
                 }
             }
@@ -210,7 +218,7 @@ export class ReplayBuffer {
                     console.log("\nSTEP\nstartIdx ", startIdx); //, "currentState ", currentState.length);
 
                     const action = this.predict(currentState, true);
-                    const nextState = await this.dataProcessor.getState(startIdx + this.barsPredicted);
+                    const nextState = await this.dataProcessor.getState(startIdx + this.barsPredicted - 1);
 
                     
                     //console.log("price change: ",nextState[nextState.length - 1] - currentState[currentState.length-1]);
@@ -289,7 +297,7 @@ export class ReplayBuffer {
             
             const reward = this.calculateReward(
                 action,
-                this.dataProcessor.normalized[startIdx + this.barsPredicted][4],
+                this.dataProcessor.normalized[startIdx + this.barsPredicted - 1][4],
                 this.dataProcessor.normalized[startIdx][4]
             );
             
@@ -474,7 +482,7 @@ async function main() {
     
     // Example prediction
     for(let i = 24; i < 96; i++) {
-        const currentState = trader.dataProcessor.getState(i);
+        const currentState = await trader.dataProcessor.getState(i);
         const prediction = trader.predict(currentState);
         const nextState = await trader.dataProcessor.getState(i+1);
 
