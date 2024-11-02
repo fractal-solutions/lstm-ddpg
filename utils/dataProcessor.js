@@ -57,7 +57,7 @@ export class DataProcessor {
     async getState(index) {
         const normalized = this.normalizeData();
         // Ensure index is within bounds
-        if (index < this.lookback || index >= normalized.length - this.lookback ) {
+        if (index < this.lookback + 5 || index >= normalized.length - this.lookback - 5 ) {
             throw new Error(`Index ${index} out of bounds`);
         }
         const sliced = normalized.slice(Math.max(0, index - this.lookback), index);

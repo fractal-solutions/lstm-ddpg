@@ -40,6 +40,7 @@ export class ReplayBuffer {
         this.batchSize = 1000;
         this.gamma = 0.99; // Discount factor
         this.tau = 0.001; // Soft update parameter
+        this.barsPredicted = 5;
         
         // Create target networks
         this.targetLSTM = new LSTM(INPUT_SIZE, HIDDEN_SIZE);
@@ -111,18 +112,18 @@ export class ReplayBuffer {
         //lower than TP or Entry stoploss for Sell BLOCK
         else if(action.positionSize < 0 && (action.stopLoss < action.takeProfit || action.stopLoss < 0 || action.takeProfit > 0)) {
             console.log("INVALID TRADE");
-            return -0.5;
+            return 0;
         }
         
         //Higher than TP or Entry stoploss for Buy BLOCK
         else if(action.positionSize > 0 && (action.stopLoss > action.takeProfit || action.stopLoss > 0 || action.takeProfit < 0)) {
             console.log("INVALID TRADE");
-            return -0.5;
+            return 0;
         }
        
         else {
             const checkStoploss = (indx) => {
-                const newCandle = this.dataProcessor.normalized[indx+1]; //o,h,l,c,v
+                const newCandle = this.dataProcessor.normalized[indx + this.barsPredicted]; //o,h,l,c,v
                 const range = this.dataProcessor.calculateRange(currentState);
                 console.log("range ",range)
                 const sl = action.positionSize > 0 ? 
@@ -209,7 +210,7 @@ export class ReplayBuffer {
                     console.log("\nSTEP\nstartIdx ", startIdx); //, "currentState ", currentState.length);
 
                     const action = this.predict(currentState, true);
-                    const nextState = await this.dataProcessor.getState(startIdx + 1);
+                    const nextState = await this.dataProcessor.getState(startIdx + this.barsPredicted);
 
                     
                     //console.log("price change: ",nextState[nextState.length - 1] - currentState[currentState.length-1]);
@@ -288,7 +289,7 @@ export class ReplayBuffer {
             
             const reward = this.calculateReward(
                 action,
-                this.dataProcessor.normalized[startIdx + 1][4],
+                this.dataProcessor.normalized[startIdx + this.barsPredicted][4],
                 this.dataProcessor.normalized[startIdx][4]
             );
             
@@ -301,8 +302,8 @@ export class ReplayBuffer {
     }
 
     getRandomIndex() {
-        const min = this.dataProcessor.lookback;
-        const max = this.dataProcessor.normalized.length - 2*(min);
+        const min = this.dataProcessor.lookback + this.barsPredicted;
+        const max = this.dataProcessor.normalized.length - 2*(min) - this.barsPredicted;
         const randomNumber = Math.floor(Math.random() * (max - min + 1)) + min;
         return randomNumber;
       }
