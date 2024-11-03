@@ -157,7 +157,7 @@ export class LSTM {
         };
     }
 
-    backward(tdError, learningRate = 0.001) {
+    backward(tdError, learningRate = 0.0001) {
         // Initialize gradients for all weights and biases
         const gradients = {
             Wf: Array(this.hiddenSize).fill().map(() => Array(this.inputSize).fill(0)),
@@ -205,7 +205,7 @@ export class LSTM {
         return this.clipGradients(gradients);
     }
 
-    updateWeights(gradients, learningRate = 0.001) {
+    updateWeights(gradients, learningRate = 0.0001) {
         // Update all weights and biases using the calculated gradients
         const updateMatrix = (target, gradient) => {
             for (let i = 0; i < target.length; i++) {

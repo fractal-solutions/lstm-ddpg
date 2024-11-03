@@ -157,6 +157,16 @@ export class ReplayBuffer {
                         const reward = (scaledPriceChange) * action.positionSize;
                         return reward;
                     }
+                    if (Math.max(...tradeHighs) < tp && Math.min(...tradeLows) > sl) {//Floating BUY
+                      // Scale price change to reasonable range
+                     console.log("FLOATING BUY");
+                     const priceChange = (currentPrice - nextPrice) / currentPrice;
+                     const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                     
+                     // Calculate scaled PnL
+                     const reward = (scaledPriceChange) * action.positionSize;
+                     return reward;
+                 }
                 } else if (action.positionSize < 0 && newCandle) { //SELL
                     if (Math.max(...tradeHighs) > sl) {
                         console.log("SL HIT");
@@ -173,6 +183,17 @@ export class ReplayBuffer {
                         const reward = (scaledPriceChange) * Math.sqrt(action.positionSize * action.positionSize);
                         return reward;
                     }
+                    if (Math.max(...tradeHighs) < sl && Math.min(...tradeLows) > tp) {//Floating SELL
+                         // Scale price change to reasonable range
+                        console.log("FLOATING SELL");
+                        const priceChange = (currentPrice - nextPrice) / currentPrice;
+                        const scaledPriceChange = Math.tanh(priceChange * 10); // Scale and bound between -1 and 1
+                        
+                        // Calculate scaled PnL
+                        const reward = (scaledPriceChange) * action.positionSize;
+                        return reward;
+                    }
+                    
                 } else {
                     // Scale price change to reasonable range
                     console.log("FLOATING PROFIT");
@@ -188,10 +209,10 @@ export class ReplayBuffer {
             
             
             // Risk management penalties (scaled)
-            const slPenalty = action.stopLoss < 0.03 ? -0.1 : 
+            const slPenalty = action.stopLoss < 0.1 ? -0.1 : 
                             action.stopLoss > 0.5 ? -0.1 : 0;
             
-            const tpPenalty = action.takeProfit < 0.05 ? -0.1 :
+            const tpPenalty = action.takeProfit < 0.1 ? -0.1 :
                             action.takeProfit > 1.0 ? -0.1 : 0;
             
             const sizePenalty = Math.abs(action.positionSize) > 0.8 ? -0.05 : 0;
@@ -489,7 +510,7 @@ async function main() {
     await Bun.sleep(3000);
     
     // Example prediction
-    for(let i = 24; i < 96; i++) {
+    for(let i = 128; i < 256; i+5) {
         const currentState = await trader.dataProcessor.getState(i);
         const prediction = trader.predict(currentState);
         const nextState = await trader.dataProcessor.getState(i+1);
