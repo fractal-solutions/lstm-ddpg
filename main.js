@@ -245,6 +245,7 @@ export class ReplayBuffer {
                     const startIdx = this.getRandomIndex();//Math.floor(Math.random() * (this.dataProcessor.normalized.length - this.dataProcessor.lookback - 2));
                     const currentState = await this.dataProcessor.getState(startIdx);
                     console.log("\nSTEP\nstartIdx ", startIdx); //, "currentState ", currentState.length);
+                    //currentState[0] = totalReward; //1st state is reward
 
                     const action = this.predict(currentState, true);
                     const nextState = await this.dataProcessor.getState(startIdx + this.barsPredicted - 1);
@@ -306,7 +307,7 @@ export class ReplayBuffer {
                 }
             }
             const averageReward = validSteps > 0 ? totalReward / validSteps : 0;
-            console.log(`Epoch ${epoch + 1}/${epochs}, Average Reward: ${averageReward.toFixed(4)}, Valid Steps: ${validSteps}`);
+            console.log(`Epoch ${epoch + 1}/${epochs}, Total Reward: ${totalReward.toFixed(4)}, Average Reward: ${averageReward.toFixed(4)}, Valid Steps: ${validSteps}`);
             
             //await Bun.sleep(2000);
             // Save model weights periodically
