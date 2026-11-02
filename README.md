@@ -19,6 +19,10 @@ walk-forward retraining, seed ensembles, and reproducible runs.
 bun install
 bun run gradcheck
 
+# 2b. Optional: download a 16-pair daily universe (Yahoo Finance)
+#     Writes data/Y_<SYMBOL>_D1.json (5.3k-7.8k bars per pair)
+bun run fetch-data
+
 # 3. Audit the features before training (walk-forward IC + stability)
 bun run audit
 
@@ -57,8 +61,11 @@ thresholds, or checkpoints on the test tail.
 |---|---|---|
 | Sanity-check the math | `bun run gradcheck` | `GRADIENT CHECK PASSED` |
 | Smoke-test the pipeline | `bun run train --epochs 1 --steps 10 --pretrain-steps 5 --no-save` | runs without NaN/Inf |
+| Fetch multi-pair data | `bun run fetch-data` | `data/Y_<SYMBOL>_D1.json` |
 | Audit features | `bun run audit` or `bun run audit --data data/EURUSD_H4.json --horizons 30,60,120` | IC, stability, candidates |
 | Train + evaluate one split | `bun run train --tf H4 --seed 1 --prefix h4` then `bun run backtest --tf H4 --model h4_bc_model --folds 3` | PF, expectancy, folds |
+| Multi-pair walk-forward | `bun run walkforward --tf D1 --data data/Y_USDJPY_D1.json --label Y_USDJPY --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher` | per-symbol OOS folds |
+| Regime-gated walk-forward | add `--regime-gate` to the command above | gate choice / skipped-regime lines |
 | Walk-forward + ensemble | `bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher` | per-fold OOS returns, teacher choices |
 | Ensemble existing models | `bun run backtest --tf H4 --ensemble h4_seed1_bc_model,h4_seed2_bc_model,h4_seed3_bc_model` | averaged policy metrics |
 | Anchored DDPG fine-tune | `bun run train --tf H1 --seed 1 --prefix anchored` | `anchored_best_model` vs `anchored_bc_model` |
@@ -133,7 +140,7 @@ Reward           = tanh((PnL_R - cost_R) / 2) * size   (risk-normalized)
 }
 ```
 
-The EURUSD files come from `fractal-solutions/paed-framework` (`data/`):
+The EURUSD intraday files come from `fractal-solutions/paed-framework` (`data/`):
 
 | Profile | File | Bars |
 |---|---|---|
@@ -142,8 +149,22 @@ The EURUSD files come from `fractal-solutions/paed-framework` (`data/`):
 | H1 | EURUSD_H1.json | 100,000 |
 | M15 | EURUSD_M15.json | 100,000 |
 
-Place them in `data/` or pass `--data <path>`. `bun run audit` automatically
-picks up every `data/EURUSD_*.json`.
+`bun run fetch-data` downloads a multi-pair daily universe from Yahoo Finance
+into `data/Y_<SYMBOL>_D1.json`:
+
+```
+EURUSD GBPUSD USDJPY AUDUSD USDCAD USDCHF NZDUSD EURGBP
+EURJPY GBPJPY EURCHF EURAUD EURCAD AUDJPY CADJPY CHFJPY
+```
+
+Coverage is 5.3k-7.8k daily bars per pair (USDJPY back to 1996; EURGBP to 1999;
+most others 2003+), which is more history than the Dukascopy daily file for
+EURUSD. Yahoo FX volume is unavailable, so those files store zero volume and the
+`volumeZ` feature is inert on them.
+
+Use `--data data/Y_USDJPY_D1.json` and a `--label` to keep checkpoints separate.
+`bun run audit` automatically picks up every `data/EURUSD_*.json`; pass
+`--data` explicitly for the Yahoo files.
 
 ## Install and verify
 
@@ -189,6 +210,7 @@ bun run train --no-bc --no-pretrain --prefix plain_ddpg
 | `--train-fraction` | Fraction used for training (default 0.8; walk-forward sets it) |
 | `--test-end` | End fraction of the evaluation block (default 1.0) |
 | `--embargo` | Gap in bars between train and test (default = `barsPredicted`) |
+| `--gate-feature`, `--gate-min`, `--gate-max` | Regime gate: trade only inside a standardized feature band |
 
 | Profile | File | Bars | Horizon | Range window | Teacher |
 |---|---|---|---|---|---|
@@ -256,6 +278,7 @@ bun run backtest --random --trades 20
 | `--random` | Use randomly initialized networks (no checkpoint) |
 | `--seed` | Seed the random init for `--random` |
 | `--train-fraction`, `--test-end` | Evaluation block boundaries (walk-forward) |
+| `--gate-feature`, `--gate-min`, `--gate-max` | Apply the regime gate used/saved by a model |
 | `--no-csv` | Skip writing CSV/JSON results |
 | `--data` | Alternate data file path |
 | `--bars`, `--range-window`, `--features` | Override profile values (must match checkpoint) |
@@ -308,9 +331,18 @@ and chooses the teacher feature and sign with the strongest stable IC (signed
 features only), then trains every seed for that fold with that teacher. This is
 fold-by-fold feature selection with no test-data leakage.
 
+`--regime-gate` re-audits regime bands on the same training window. It scores
+quintile bands of volatility/trend features for the selected teacher, requires
+stability across training sub-folds, and passes the best band to training and
+backtest (`--gate-feature/--gate-min/--gate-max`). Outside the band the policy is
+forced flat. The gate is *selective*: if the ungated teacher baseline is already
+positive in training, no gate is applied. This avoids weakening symbols that
+already work, but it can still be fooled when the training baseline is
+optimistic (see GBPUSD below).
+
 Each fold writes `<tf>_wf<fold>_s<seed>_*` checkpoints; the aggregate summary is
 written to
-`backtest_results/walkforward_<TF>_<model>[_sel]_s<n>_f<n>_st<start>.json`.
+`backtest_results/walkforward_<label>_<model>[_sel][_gate]_s<n>_f<n>_st<start>.json`.
 The table reports per-fold seed-average return, ensemble return, PF, trades, and
 drawdown; the aggregate is the compounded ensemble return across OOS folds.
 
@@ -396,6 +428,22 @@ the embargo.
 | D1 h20 (3 seeds) | +8.52 / +0.46 / -3.72 / -3.19 / -1.33% | +0.26% | 2/5 | bollingerB, bollingerB, ret60z(+), bollingerB, bollingerB | -1.59 / -3.13 / -3.76 / -3.89 / -2.98% |
 | H1 h480 (2 seeds) | -8.51 / -3.22 / +2.92 / -0.53 / -2.56% | **-11.67%** | 1/5 | slope20, ret60z, ret60z, ret60z, ret60z | -10.39 / -4.89 / -1.72 / -3.84 / -5.88% |
 
+### Multi-pair Yahoo D1 (5 folds, start 0.4, embargo, 3-seed ensemble)
+
+| Symbol | No-gate total | Positive folds | Selective-gate total | Positive folds | Gate behavior |
+|---|---|---|---|---|---|
+| USDJPY | **+14.35%** | 4/5 | +14.35% | 4/5 | skipped (training baseline positive) |
+| AUDUSD | +10.16% | 4/5 | **+11.07%** | **5/5** | gated folds 1-2, skipped 3-5 |
+| EURUSD | -5.84% | 2/5 | -5.84% | 2/5 | gated fold 1 only, no effect |
+| GBPUSD | **-15.98%** | 1/5 | -15.98% | 1/5 | skipped (training baseline positive) |
+
+A forced (non-selective) gate told a different story: it rescued GBPUSD to
++1.05% (4/5 folds) but only 1-10 trades per fold, while breaking USDJPY
+(+14.35% -> -5.44%) and cutting AUDUSD to +1.29%. So a universal gate is not the
+fix. The selective gate helps AUDUSD slightly and leaves the good symbols alone,
+but it skipped GBPUSD because its *training* baseline was positive, even though
+its OOS folds failed.
+
 **Anchored DDPG fine-tune** (H1, 3-fold protocol, 10 epochs x 25 steps, 2 seeds):
 
 | Dataset | Fold returns | Total | Positive folds | Fold max DD |
@@ -420,6 +468,13 @@ What this means:
   stable signal.
 - D1 is essentially flat (+0.26%, 2/5) and its total is dominated by fold 1
   (+8.52%). H1 fails outright (-11.67%, 1/5).
+- Across the Yahoo majors, the edge is **cross-sectional**: USDJPY and AUDUSD
+  survive the 5-fold/embargo protocol (+14.35% and +10.16%), while EURUSD and
+  GBPUSD fail (-5.84% and -15.98%). More data did not create a universal edge;
+  it revealed which pairs carry it.
+- Regime gating is not a reliable universal fix. Forced gating rescued GBPUSD
+  but broke USDJPY; selective gating helps AUDUSD slightly but still fails to
+  detect GBPUSD because its training baseline is optimistic.
 - Anchored DDPG is not additive: +0.75% over 3 folds with 1/3 positive folds and
   a -11.4% drawdown in one fold.
 - Unrestricted DDPG earlier collapsed to constant direction; BC plus per-fold
@@ -429,34 +484,43 @@ What this means:
 Reproduce:
 
 ```bash
-bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0
+# EURUSD H4
 bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher
+
+# Multi-pair Yahoo D1 (repeat per symbol)
+bun run fetch-data
+bun run walkforward --tf D1 --data data/Y_USDJPY_D1.json --label Y_USDJPY --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher
+bun run walkforward --tf D1 --data data/Y_AUDUSD_D1.json --label Y_AUDUSD --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher --regime-gate
 ```
 
 ## Known limitations / next steps
 
-1. **Regime dependence is the next blocker**: 5-fold/embargoed walk-forward
-   removes the fixed-teacher H4 edge; per-fold selection recovers only H4, and
-   even there one fold dominates and the teacher changes across folds. The next
-   fix is data/regime, not more RL: add more instruments/history, or build an
-   explicit regime gate/filter, then re-run this protocol.
-2. **Policy learning**: BC is the best policy; anchored DDPG is not reliably
+1. **Cross-sectional selection is the next fix**: more data shows the edge is
+   pair-specific (USDJPY/AUDUSD work; EURUSD/GBPUSD fail). The next step is a
+   training-only universe rule (e.g., require a pair to be positive in most
+   training folds and have stable teacher IC) and then trade the selected basket
+   out-of-sample. Do not add pairs by looking at the test tail.
+2. **Regime gating is not solved**: forced gates can rescue a weak pair but break
+   a working one; the selective rule overfits the training baseline (GBPUSD).
+   Improve the gate criterion (cross-validation across training folds, minimum
+   trade coverage) before trusting it.
+3. **Policy learning**: BC is the best policy; anchored DDPG is not reliably
    additive. Keep `bc_model` as the reference and only change the RL layer after
-   the data/regime issue is addressed.
-3. **Signal**: the audited edge is modest and contrarian around ~20 days. Keep
+   pair selection is stable.
+4. **Signal**: the audited edge is modest and contrarian around ~20 days. Keep
    the feature/teacher set pre-registered; adding indicators without an audit
    will overfit.
-4. **Data**: one instrument and one history. More pairs and timeframes would
-   test whether the edge is structural or EURUSD-specific.
-5. **Reward**: risk-normalized R is implemented, but portfolio drawdown,
+5. **Data**: 16 daily pairs are fetched, but only 4 majors have been evaluated
+   under the full protocol so far. Run the rest before drawing conclusions.
+6. **Reward**: risk-normalized R is implemented, but portfolio drawdown,
    turnover, and slippage beyond the spread are not. Add them if the policy
    over-trades.
-6. **Compute**: pure JS BPTT is correct but slow. Vectorized/typed-array math
+7. **Compute**: pure JS BPTT is correct but slow. Vectorized/typed-array math
    would enable larger walk-forward sweeps.
-7. **Validation**: model selection still uses a slice of the training region.
+8. **Validation**: model selection still uses a slice of the training region.
    Rolling walk-forward validation and seed ensembles are the preferred
    protocol.
-8. **Determinism**: `--seed` covers weight init, replay sampling, and
+9. **Determinism**: `--seed` covers weight init, replay sampling, and
    exploration, but not OS threading/number formatting.
 
 ## Troubleshooting
@@ -477,8 +541,9 @@ bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --sel
 ```
 main.js                 # environment, features, pretrain, BC, anchored DDPG
 backtest.js             # sequential/fold backtest, ensembles, metrics, CSV/JSON
-walkforward.js          # expanding-window retraining + per-fold seed ensembles
+walkforward.js          # expanding-window retraining + per-fold ensembles/gates
 sweep.js                # multi-seed train + backtest comparison
+fetchYahoo.js           # downloads multi-pair daily OHLC from Yahoo Finance
 signalAudit.js          # walk-forward feature IC/stability/hit-rate audit
 gradcheck.js            # finite-difference gradient verification
 utils/nn.js             # Dense, activations, Adam, soft updates
