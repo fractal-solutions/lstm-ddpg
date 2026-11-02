@@ -102,6 +102,7 @@ export function resolveConfig(args = {}) {
     if (args['gate-feature']) config.gateFeature = String(args['gate-feature']);
     if (args['gate-min'] !== undefined) config.gateMin = Number(args['gate-min']);
     if (args['gate-max'] !== undefined) config.gateMax = Number(args['gate-max']);
+    if (args['model-dir']) config.modelDir = String(args['model-dir']);
     return config;
 }
 

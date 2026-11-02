@@ -152,6 +152,22 @@ function parseArgs(argv) {
     return options;
 }
 
+function trimData(data, points) {
+    const n = data.close.length;
+    if (!points || points <= 0 || n <= points) return data;
+    const start = n - points;
+    return {
+        ...data,
+        bars: points,
+        time: data.time.slice(start),
+        open: data.open.slice(start),
+        high: data.high.slice(start),
+        low: data.low.slice(start),
+        close: data.close.slice(start),
+        volume: data.volume.slice(start)
+    };
+}
+
 function run(command) {
     const result = Bun.spawnSync(command, { cwd: ROOT, stdout: 'pipe', stderr: 'pipe' });
     if (result.exitCode !== 0) {
@@ -197,13 +213,18 @@ const selectGate = args['regime-gate'] === true;
 const dataPath = args.data ? String(args.data) : profile.dataPath;
 const label = String(args.label ?? (args.data ? basename(dataPath, extname(dataPath)) : tf));
 const needsSelection = selectPerFold || selectGate;
-const data = needsSelection ? await Bun.file(dataPath).json() : null;
+const dataPoints = args['data-points'] ? Number(args['data-points']) : null;
+const data = needsSelection
+    ? trimData(await Bun.file(dataPath).json(), dataPoints)
+    : null;
 const featureData = needsSelection ? buildFeatureMatrix(data) : null;
 const spreadPrice = data ? (data.spread ?? 0) * (data.point ?? 0.00001) : 0;
 const dataArgs = args.data ? ['--data', String(args.data)] : [];
+const modelDirArgs = args['model-dir'] ? ['--model-dir', String(args['model-dir'])] : [];
+const dataPointsArgs = args['data-points'] ? ['--data-points', String(args['data-points'])] : [];
 const allowedTeachers = new Set(DEFAULT_CONFIG.featureNames);
 
-const trainArgs = ['bun', 'run', 'main.js', '--tf', tf, ...dataArgs];
+const trainArgs = ['bun', 'run', 'main.js', '--tf', tf, ...dataArgs, ...modelDirArgs, ...dataPointsArgs];
 for (const key of ['epochs', 'steps', 'batch', 'hidden', 'pretrain-epochs', 'pretrain-steps', 'bc-epochs', 'bc-steps', 'bc-anchor']) {
     if (args[key] !== undefined) trainArgs.push(`--${key}`, String(args[key]));
 }
@@ -298,6 +319,8 @@ for (let fold = 0; fold < folds; fold++) {
             '--tf', tf,
             ...dataArgs,
             '--model', `${prefix}_${modelSuffix}`,
+            ...modelDirArgs,
+            ...dataPointsArgs,
             ...gateArgs,
             ...embargoArgs,
             '--train-fraction', String(trainFraction),
@@ -314,6 +337,8 @@ for (let fold = 0; fold < folds; fold++) {
         '--tf', tf,
         ...dataArgs,
         '--ensemble', prefixes.map(prefix => `${prefix}_${modelSuffix}`).join(','),
+        ...modelDirArgs,
+        ...dataPointsArgs,
         ...gateArgs,
         ...embargoArgs,
         '--train-fraction', String(trainFraction),

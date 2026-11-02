@@ -36,7 +36,11 @@ bun run backtest --tf D1 --model first_bc_model --folds 3
 # 6. Honest out-of-sample check: 5 folds, embargo, per-fold teacher
 bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher
 
-# 7. Optional: compare seeds on one split
+# 7. Cross-sectional selection across the 16-pair universe
+bun run fetch-data
+bun run universe --folds 5 --start 0.4 --seeds 1,2 --data-points 5000 --concurrency 6
+
+# 8. Optional: compare seeds on one split
 bun run sweep --tf H4 --epochs 0 --seeds 1,2,3 --folds 3
 ```
 
@@ -66,6 +70,7 @@ thresholds, or checkpoints on the test tail.
 | Train + evaluate one split | `bun run train --tf H4 --seed 1 --prefix h4` then `bun run backtest --tf H4 --model h4_bc_model --folds 3` | PF, expectancy, folds |
 | Multi-pair walk-forward | `bun run walkforward --tf D1 --data data/Y_USDJPY_D1.json --label Y_USDJPY --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher` | per-symbol OOS folds |
 | Regime-gated walk-forward | add `--regime-gate` to the command above | gate choice / skipped-regime lines |
+| Training-only universe basket | `bun run universe --folds 5 --start 0.4 --seeds 1,2 --data-points 5000 --concurrency 6` | eligible basket vs all-symbol basket |
 | Walk-forward + ensemble | `bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher` | per-fold OOS returns, teacher choices |
 | Ensemble existing models | `bun run backtest --tf H4 --ensemble h4_seed1_bc_model,h4_seed2_bc_model,h4_seed3_bc_model` | averaged policy metrics |
 | Anchored DDPG fine-tune | `bun run train --tf H1 --seed 1 --prefix anchored` | `anchored_best_model` vs `anchored_bc_model` |
@@ -350,6 +355,38 @@ drawdown; the aggregate is the compounded ensemble return across OOS folds.
 `size`, `SL fraction`, `TP fraction`) across models and simulates the averaged
 action.
 
+## Universe selection (training-only)
+
+`universe.js` runs the walk-forward for every symbol, then decides eligibility
+per symbol and per fold using **only the training window**:
+
+1. select a teacher from the signed audited features (same rule as
+   `--select-teacher`);
+2. compute the teacher's net return over five training sub-folds;
+3. require positive overall training net return and at least 4/5 positive
+   sub-folds, with >=200 observations.
+
+It then builds an equal-weight basket of eligible symbols on each out-of-sample
+block. No test return is used for selection.
+
+```bash
+bun run fetch-data
+bun run universe --folds 5 --start 0.4 --seeds 1,2 \
+  --data-points 5000 --concurrency 6
+```
+
+Notes:
+
+- `--data-points 5000` trims each pair to the last 5,000 bars so the fold
+  fractions are approximately aligned across symbols (they end on the same date
+  but have slightly different trading calendars).
+- Checkpoints are written to the OS temp directory (`lstm-ddpg-universe-models`),
+  not the repo. The summary is
+  `backtest_results/universe_s<n>_f<n>_st<start>_d<bars>.json`.
+- This is a screen, not proof: 16 symbols x 5 folds creates many opportunities
+  for a false winner. Any result must be pre-registered and then validated on
+  data not used for the rule, not re-tuned until it looks good.
+
 ## Multi-seed sweep
 
 ```bash
@@ -444,6 +481,26 @@ fix. The selective gate helps AUDUSD slightly and leaves the good symbols alone,
 but it skipped GBPUSD because its *training* baseline was positive, even though
 its OOS folds failed.
 
+### Training-only universe basket (16 pairs, 5 folds, 2 seeds, last 5,000 bars)
+
+| Basket | Total | Positive folds |
+|---|---|---|
+| Eligible (selected from training only) | **+1.91%** | 3/5 |
+| All symbols, equal weight | -2.50% | 2/5 |
+| Test-fitted oracle (not achievable) | +4.26% | - |
+
+Per-symbol OOS totals ranged from -17.46% (EURAUD) to +11.94% (USDJPY,
+5/5 positive folds). 7 of 16 symbols were positive overall. Selection added
+value over holding everything, but it is noisy:
+
+- USDJPY was the strongest symbol but was eligible in only 2/5 folds, so the
+  basket captured only part of its return.
+- EURAUD (-17.46%) and USDCHF (-10.36%) were eligible in 3/5 folds, so the
+  criterion also admitted losers.
+- The basket's +1.91% is not a tradable result yet: two seeds, approximate fold
+  alignment, spread-only costs, and no out-of-sample confirmation of the
+  selection rule.
+
 **Anchored DDPG fine-tune** (H1, 3-fold protocol, 10 epochs x 25 steps, 2 seeds):
 
 | Dataset | Fold returns | Total | Positive folds | Fold max DD |
@@ -475,6 +532,9 @@ What this means:
 - Regime gating is not a reliable universal fix. Forced gating rescued GBPUSD
   but broke USDJPY; selective gating helps AUDUSD slightly but still fails to
   detect GBPUSD because its training baseline is optimistic.
+- Training-only universe selection improves on holding everything (+1.91% vs
+  -2.50% basket) but is noisy: it missed most of USDJPY's profitable folds and
+  admitted losing symbols. It is a useful screen, not yet a portfolio rule.
 - Anchored DDPG is not additive: +0.75% over 3 folds with 1/3 positive folds and
   a -11.4% drawdown in one fold.
 - Unrestricted DDPG earlier collapsed to constant direction; BC plus per-fold
@@ -495,23 +555,25 @@ bun run walkforward --tf D1 --data data/Y_AUDUSD_D1.json --label Y_AUDUSD --fold
 
 ## Known limitations / next steps
 
-1. **Cross-sectional selection is the next fix**: more data shows the edge is
-   pair-specific (USDJPY/AUDUSD work; EURUSD/GBPUSD fail). The next step is a
-   training-only universe rule (e.g., require a pair to be positive in most
-   training folds and have stable teacher IC) and then trade the selected basket
-   out-of-sample. Do not add pairs by looking at the test tail.
+1. **The next step is a pre-registered go/no-go, not more tuning**: the
+   training-only universe basket is implemented and beats the all-symbol basket
+   (+1.91% vs -2.50%) but is noisy. Freeze the rule now, add realistic
+   commission/slippage, and validate on a period not used for any selection.
+   Acceptance example: positive in >=4/5 OOS folds across >=3 seeds and a
+   drawdown/turnover budget. If it fails, stop instead of adding filters.
 2. **Regime gating is not solved**: forced gates can rescue a weak pair but break
    a working one; the selective rule overfits the training baseline (GBPUSD).
-   Improve the gate criterion (cross-validation across training folds, minimum
-   trade coverage) before trusting it.
+   Treat gating as research only until it passes the same held-out gate.
 3. **Policy learning**: BC is the best policy; anchored DDPG is not reliably
    additive. Keep `bc_model` as the reference and only change the RL layer after
    pair selection is stable.
 4. **Signal**: the audited edge is modest and contrarian around ~20 days. Keep
    the feature/teacher set pre-registered; adding indicators without an audit
    will overfit.
-5. **Data**: 16 daily pairs are fetched, but only 4 majors have been evaluated
-   under the full protocol so far. Run the rest before drawing conclusions.
+5. **Data**: 16 daily pairs are fetched and screened, but folds are only
+   approximately aligned (all end on the same date, different calendars) and the
+   universe run used 2 seeds. More history and exact date alignment are needed
+   before treating the basket as a portfolio.
 6. **Reward**: risk-normalized R is implemented, but portfolio drawdown,
    turnover, and slippage beyond the spread are not. Add them if the policy
    over-trades.
@@ -542,6 +604,7 @@ bun run walkforward --tf D1 --data data/Y_AUDUSD_D1.json --label Y_AUDUSD --fold
 main.js                 # environment, features, pretrain, BC, anchored DDPG
 backtest.js             # sequential/fold backtest, ensembles, metrics, CSV/JSON
 walkforward.js          # expanding-window retraining + per-fold ensembles/gates
+universe.js             # training-only per-fold symbol selection + basket
 sweep.js                # multi-seed train + backtest comparison
 fetchYahoo.js           # downloads multi-pair daily OHLC from Yahoo Finance
 signalAudit.js          # walk-forward feature IC/stability/hit-rate audit
