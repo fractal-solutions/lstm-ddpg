@@ -1,11 +1,13 @@
 import { clamp } from './rng.js';
 import { buildFeatureMatrix } from './features.js';
+import { buildMacroMatrix, MACRO_FEATURE_NAMES } from './macroFeatures.js';
 
 export class DataProcessor {
-    constructor(data, { lookback = 60, dataPoints = null } = {}) {
+    constructor(data, { lookback = 60, dataPoints = null, symbol = null } = {}) {
         this.data = data;
         this.lookback = lookback;
         this.dataPoints = dataPoints;
+        this.symbol = symbol ?? data.symbol ?? null;
         this.features = ['open', 'high', 'low', 'close', 'volume'];
         this.normalized = null;
         this.combined = null;
@@ -78,15 +80,65 @@ export class DataProcessor {
         return this.normalized;
     }
 
+    trimmedData() {
+        const n = this.data.close.length;
+        const points = this.dataPoints ?? n;
+        if (points >= n) return this.data;
+        const start = n - points;
+        return {
+            ...this.data,
+            bars: points,
+            time: this.data.time?.slice(start),
+            open: this.data.open.slice(start),
+            high: this.data.high.slice(start),
+            low: this.data.low.slice(start),
+            close: this.data.close.slice(start),
+            volume: this.data.volume.slice(start)
+        };
+    }
+
     /**
      * Builds standardized model inputs from the audited causal feature set.
-     * Feature statistics come from the training region only.
+     * Price and macro features are built on the same trimmed window so state
+     * and execution indices always line up. Statistics use the training region.
      */
-    buildFeatures(trainEnd, featureNames) {
-        const { matrix: full, featureNames: allNames, warmup } = buildFeatureMatrix(this.data);
-        this.warmup = warmup;
-        this.stateStart = warmup + this.lookback;
+    async buildFeatures(trainEnd, featureNames) {
+        const trimmed = this.trimmedData();
+        const price = buildFeatureMatrix(trimmed);
+        const needsMacro = featureNames.some(name => MACRO_FEATURE_NAMES.includes(name));
+
+        let macro = null;
+        if (needsMacro) {
+            macro = await buildMacroMatrix(trimmed, this.symbol);
+            if (!macro.matrix) {
+                throw new Error('Macro features requested, but macro data or valid bar timestamps are unavailable');
+            }
+            if (macro.firstValid === -1) {
+                throw new Error('No bar has complete macro coverage; shorten the history with --data-points');
+            }
+        }
+
+        const allNames = [...price.featureNames, ...(macro ? macro.names : [])];
+        const n = trimmed.close.length;
+        const full = new Array(n);
+
+        for (let i = 0; i < n; i++) {
+            if (macro) {
+                if (!price.matrix[i] || !macro.matrix[i]) {
+                    full[i] = null;
+                } else {
+                    full[i] = [...price.matrix[i], ...macro.matrix[i]];
+                }
+            } else {
+                full[i] = price.matrix[i] ?? null;
+            }
+        }
+
+        const firstValid = Math.max(price.warmup, macro ? macro.firstValid : 0);
+        this.warmup = firstValid;
+        this.stateStart = firstValid + this.lookback;
         this.featureNames = featureNames;
+        this.macroFirstValid = macro ? macro.firstValid : null;
 
         const indices = featureNames.map(name => {
             const index = allNames.indexOf(name);
@@ -94,27 +146,34 @@ export class DataProcessor {
             return index;
         });
 
-        const end = Math.max(warmup + 2, Math.min(trainEnd, full.length));
+        const end = Math.min(trainEnd, n);
+        if (end <= firstValid + 2) {
+            throw new Error(`Not enough bars after macro coverage (firstValid=${firstValid}, trainEnd=${end})`);
+        }
+
         const means = new Array(featureNames.length).fill(0);
         const stds = new Array(featureNames.length).fill(0);
         let count = 0;
-        for (let i = warmup; i < end; i++) {
+        for (let i = firstValid; i < end; i++) {
+            if (!full[i]) continue;
             for (let f = 0; f < indices.length; f++) means[f] += full[i][indices[f]];
             count++;
         }
-        if (count === 0) throw new Error('Not enough bars to build features');
+        if (count === 0) throw new Error('Not enough valid bars to build features');
         for (let f = 0; f < means.length; f++) means[f] /= count;
-        for (let i = warmup; i < end; i++) {
+
+        for (let i = firstValid; i < end; i++) {
+            if (!full[i]) continue;
             for (let f = 0; f < indices.length; f++) {
                 stds[f] += (full[i][indices[f]] - means[f]) ** 2;
             }
         }
         for (let f = 0; f < stds.length; f++) stds[f] = Math.sqrt(stds[f] / count) || 1e-8;
 
-        this.featureStats = { means, stds, warmup, trainEnd: end };
-        this.featureMatrix = new Array(full.length);
-        for (let i = 0; i < full.length; i++) {
-            if (i < warmup) {
+        this.featureStats = { means, stds, warmup: firstValid, trainEnd: end };
+        this.featureMatrix = new Array(n);
+        for (let i = 0; i < n; i++) {
+            if (i < firstValid || !full[i]) {
                 this.featureMatrix[i] = null;
                 continue;
             }

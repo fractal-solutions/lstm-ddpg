@@ -1,21 +1,32 @@
-import { join } from 'node:path';
+import { join, basename } from 'node:path';
 import { LSTM } from './models/lstm.js';
 import { DDPG } from './models/ddpg.js';
 import { DataProcessor } from './utils/dataProcessor.js';
 import { Adam, Dense, softUpdateParams, copyParams } from './utils/nn.js';
 import { randn, clamp, setSeed } from './utils/rng.js';
+import { loadRates, carryAnnual, dateFromTimestamp, pairCurrencies } from './utils/macro.js';
+import { MACRO_FEATURE_NAMES } from './utils/macroFeatures.js';
 
 const ROOT = import.meta.dir;
 
+export const PRICE_FEATURE_NAMES = [
+    'ret1z', 'ret5z', 'ret20z', 'ret60z',
+    'atrRel', 'volRatio',
+    'dist20', 'dist50', 'slope20',
+    'donchian20', 'rsi14', 'bollingerB'
+];
+
+export function featureNamesForSet(featureSet) {
+    if (featureSet === 'price') return [...PRICE_FEATURE_NAMES];
+    if (featureSet === 'price+macro') return [...PRICE_FEATURE_NAMES, ...MACRO_FEATURE_NAMES];
+    if (featureSet === 'macro') return [...MACRO_FEATURE_NAMES];
+    throw new Error(`Unknown feature set "${featureSet}" (use price, price+macro, or macro)`);
+}
+
 export const DEFAULT_CONFIG = {
     lookback: 60,
-    // Audited causal features (see signalAudit.js / README)
-    featureNames: [
-        'ret1z', 'ret5z', 'ret20z', 'ret60z',
-        'atrRel', 'volRatio',
-        'dist20', 'dist50', 'slope20',
-        'donchian20', 'rsi14', 'bollingerB'
-    ],
+    featureSet: 'price',
+    featureNames: [...PRICE_FEATURE_NAMES],
     hiddenSize: 32,
     actionSize: 4,          // [direction, size, SL fraction, TP fraction]
     barsPredicted: 20,
@@ -68,8 +79,12 @@ export const DEFAULT_CONFIG = {
     // Learning-rate schedule
     lrDecay: 0.99,
     minLr: 1e-5,
-    // Costs
+    // Costs (fractions per side unless noted)
     spreadPoints: null,     // null => read from the data file
+    commissionPct: 0.00005, // 0.5 bps per side
+    slippagePct: 0.00005,   // 0.5 bps per side
+    useCarry: true,         // rate-differential financing using data/macro rates
+    symbol: null,
     seed: null,
     dataPath: join(ROOT, 'data', 'EURUSD_D1.json'),
     modelDir: join(ROOT, 'saved_models')
@@ -95,7 +110,14 @@ export function resolveConfig(args = {}) {
     if (args.bars) config.barsPredicted = Number(args.bars);
     if (args['range-window']) config.rangeWindow = Number(args['range-window']);
     if (args['data-points']) config.dataPoints = Number(args['data-points']);
-    if (args.features) config.featureNames = String(args.features).split(',');
+    if (args['feature-set']) {
+        config.featureSet = String(args['feature-set']);
+        config.featureNames = featureNamesForSet(config.featureSet);
+    }
+    if (args.features) {
+        config.featureNames = String(args.features).split(',');
+        config.featureSet = 'custom';
+    }
     if (args['train-fraction']) config.trainFraction = Number(args['train-fraction']);
     if (args['test-end']) config.testEndFraction = Number(args['test-end']);
     if (args.embargo !== undefined) config.embargoBars = Number(args.embargo);
@@ -103,6 +125,10 @@ export function resolveConfig(args = {}) {
     if (args['gate-min'] !== undefined) config.gateMin = Number(args['gate-min']);
     if (args['gate-max'] !== undefined) config.gateMax = Number(args['gate-max']);
     if (args['model-dir']) config.modelDir = String(args['model-dir']);
+    if (args.commission !== undefined) config.commissionPct = Number(args.commission);
+    if (args.slippage !== undefined) config.slippagePct = Number(args.slippage);
+    if (args['no-carry']) config.useCarry = false;
+    if (args.symbol) config.symbol = String(args.symbol).toUpperCase();
     return config;
 }
 
@@ -160,6 +186,11 @@ export class TradingSystem {
         this.noiseSigma = cfg.noiseSigma;
         this.ouState = new Array(cfg.actionSize).fill(0);
         this.spreadPrice = 0;
+        this.symbol = null;
+        this.baseCurrency = null;
+        this.quoteCurrency = null;
+        this.rates = null;
+        this.carryEnabled = false;
 
         this.dataProcessor = null;
         this.testStart = null;
@@ -173,17 +204,29 @@ export class TradingSystem {
 
     async loadData(path = this.config.dataPath) {
         const data = await Bun.file(path).json();
+        const inferredSymbol = this.config.symbol ?? data.symbol ??
+            (basename(path).match(/[A-Z]{6}/)?.[0] ?? null);
+        this.symbol = inferredSymbol ? String(inferredSymbol).toUpperCase() : null;
+        const pair = pairCurrencies(this.symbol);
+        this.baseCurrency = pair?.base ?? null;
+        this.quoteCurrency = pair?.quote ?? null;
+
         this.dataProcessor = new DataProcessor(data, {
             lookback: this.config.lookback,
-            dataPoints: this.config.dataPoints
+            dataPoints: this.config.dataPoints,
+            symbol: this.symbol
         });
         this.dataProcessor.normalizeData(this.config.dataPoints ?? data.close.length);
         this.initializeSplit();
-        this.dataProcessor.buildFeatures(this.trainEnd, this.config.featureNames);
+        await this.dataProcessor.buildFeatures(this.trainEnd, this.config.featureNames);
 
         const point = Number.isFinite(data.point) ? data.point : 0.00001;
         const spreadPoints = this.config.spreadPoints ?? (Number.isFinite(data.spread) ? data.spread : 0);
         this.spreadPrice = spreadPoints * point;
+
+        const timeValid = Array.isArray(data.time) && data.time.length > 0 && data.time[0] > 946684800;
+        this.carryEnabled = this.config.useCarry === true && timeValid && this.baseCurrency !== null;
+        this.rates = this.carryEnabled ? await loadRates() : null;
 
         return data;
     }
@@ -350,10 +393,25 @@ export class TradingSystem {
 
         if (exitPrice === null) exitPrice = dp.getBar(lastIndex).close;
 
+        const barsHeld = exitIndex - index + 1;
         const pnlPct = direction * (exitPrice - entry) / entry;
         const pnlR = direction * (exitPrice - entry) / slDistance;
-        const costPct = this.spreadPrice / entry;
-        const costR = this.spreadPrice / slDistance;
+
+        const spreadCostPct = this.spreadPrice / entry;
+        const slippageCostPct = 2 * this.config.slippagePct;
+        const commissionCostPct = 2 * this.config.commissionPct;
+        let carryPct = 0;
+        if (this.carryEnabled && dp.data.time) {
+            const entryDate = dateFromTimestamp(dp.data.time[index - 1]);
+            const annual = carryAnnual(this.rates, this.baseCurrency, this.quoteCurrency, entryDate) ?? 0;
+            // Positive carry benefits the position; negative carry is a cost.
+            carryPct = direction * annual * barsHeld / 252;
+        }
+
+        const costPct = spreadCostPct + slippageCostPct + commissionCostPct - carryPct;
+        const netPct = pnlPct - costPct;
+        const riskFraction = slDistance / entry;
+        const netR = riskFraction > 0 ? netPct / riskFraction : 0;
 
         return {
             entry,
@@ -364,11 +422,16 @@ export class TradingSystem {
             size,
             pnlPct,
             pnlR,
+            spreadCostPct,
+            slippageCostPct,
+            commissionCostPct,
+            carryPct,
             costPct,
-            costR,
-            netR: pnlR - costR,
+            costR: pnlR - netR,
+            netPct,
+            netR,
             exitIndex,
-            barsHeld: exitIndex - index + 1,
+            barsHeld,
             reason,
             range,
             slMultiple,
@@ -865,6 +928,7 @@ export class TradingSystem {
                 savedAt: new Date().toISOString(),
                 timeframe: this.config.timeframe ?? null,
                 lookback: this.config.lookback,
+                featureSet: this.config.featureSet,
                 featureNames: this.config.featureNames,
                 hiddenSize: this.config.hiddenSize,
                 actionSize: this.config.actionSize,
@@ -878,6 +942,10 @@ export class TradingSystem {
                 freezeEncoder: this.freezeEncoder,
                 bcAnchor: this.config.bcAnchor,
                 gate: this.gate,
+                symbol: this.symbol,
+                commissionPct: this.config.commissionPct,
+                slippagePct: this.config.slippagePct,
+                useCarry: this.config.useCarry,
                 testStart: this.testStart,
                 stateGain: this.stateGain,
                 seed: this.config.seed,
@@ -940,6 +1008,11 @@ export class TradingSystem {
             this.gate = modelData.meta.gate;
         }
         if (Number.isFinite(modelData.meta?.spreadPrice)) this.spreadPrice = modelData.meta.spreadPrice;
+        if (modelData.meta?.symbol && this.symbol && modelData.meta.symbol !== this.symbol) {
+            throw new Error(
+                `Checkpoint "${filename}" was trained on ${modelData.meta.symbol}, data is ${this.symbol}.`
+            );
+        }
 
         return modelData;
     }

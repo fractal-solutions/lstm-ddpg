@@ -10,7 +10,9 @@
     "walkforward": "bun run walkforward.js",
     "universe": "bun run universe.js",
     "fetch-data": "bun run fetchYahoo.js",
-    "audit": "bun run signalAudit.js"
+    "fetch-macro": "bun run fetchMacro.js",
+    "audit": "bun run signalAudit.js",
+    "macro-audit": "bun run macroAudit.js"
   },
   "devDependencies": {
     "@types/bun": "latest"

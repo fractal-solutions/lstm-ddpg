@@ -222,9 +222,10 @@ const spreadPrice = data ? (data.spread ?? 0) * (data.point ?? 0.00001) : 0;
 const dataArgs = args.data ? ['--data', String(args.data)] : [];
 const modelDirArgs = args['model-dir'] ? ['--model-dir', String(args['model-dir'])] : [];
 const dataPointsArgs = args['data-points'] ? ['--data-points', String(args['data-points'])] : [];
+const featureSetArgs = args['feature-set'] ? ['--feature-set', String(args['feature-set'])] : [];
 const allowedTeachers = new Set(DEFAULT_CONFIG.featureNames);
 
-const trainArgs = ['bun', 'run', 'main.js', '--tf', tf, ...dataArgs, ...modelDirArgs, ...dataPointsArgs];
+const trainArgs = ['bun', 'run', 'main.js', '--tf', tf, ...dataArgs, ...modelDirArgs, ...dataPointsArgs, ...featureSetArgs];
 for (const key of ['epochs', 'steps', 'batch', 'hidden', 'pretrain-epochs', 'pretrain-steps', 'bc-epochs', 'bc-steps', 'bc-anchor']) {
     if (args[key] !== undefined) trainArgs.push(`--${key}`, String(args[key]));
 }
@@ -321,6 +322,7 @@ for (let fold = 0; fold < folds; fold++) {
             '--model', `${prefix}_${modelSuffix}`,
             ...modelDirArgs,
             ...dataPointsArgs,
+            ...featureSetArgs,
             ...gateArgs,
             ...embargoArgs,
             '--train-fraction', String(trainFraction),
@@ -339,6 +341,7 @@ for (let fold = 0; fold < folds; fold++) {
         '--ensemble', prefixes.map(prefix => `${prefix}_${modelSuffix}`).join(','),
         ...modelDirArgs,
         ...dataPointsArgs,
+        ...featureSetArgs,
         ...gateArgs,
         ...embargoArgs,
         '--train-fraction', String(trainFraction),

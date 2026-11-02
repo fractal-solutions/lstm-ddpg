@@ -23,8 +23,12 @@ bun run gradcheck
 #     Writes data/Y_<SYMBOL>_D1.json (5.3k-7.8k bars per pair)
 bun run fetch-data
 
-# 3. Audit the features before training (walk-forward IC + stability)
+# 2c. Rates/carry and macro/cross-asset data (FRED + gold via Yahoo)
+bun run fetch-macro
+
+# 3. Audit the price features, then the macro/carry features
 bun run audit
+bun run macro-audit
 
 # 4. Train a reproducible model (writes saved_models/first_*)
 bun run train --tf D1 --seed 1 --prefix first
@@ -66,7 +70,9 @@ thresholds, or checkpoints on the test tail.
 | Sanity-check the math | `bun run gradcheck` | `GRADIENT CHECK PASSED` |
 | Smoke-test the pipeline | `bun run train --epochs 1 --steps 10 --pretrain-steps 5 --no-save` | runs without NaN/Inf |
 | Fetch multi-pair data | `bun run fetch-data` | `data/Y_<SYMBOL>_D1.json` |
-| Audit features | `bun run audit` or `bun run audit --data data/EURUSD_H4.json --horizons 30,60,120` | IC, stability, candidates |
+| Fetch rates/macro data | `bun run fetch-macro` | `data/macro/*.json` |
+| Audit price features | `bun run audit` or `bun run audit --data data/EURUSD_H4.json --horizons 30,60,120` | IC, stability, candidates |
+| Audit macro/carry | `bun run macro-audit` | carry, VIX, DXY, yields, oil, gold IC |
 | Train + evaluate one split | `bun run train --tf H4 --seed 1 --prefix h4` then `bun run backtest --tf H4 --model h4_bc_model --folds 3` | PF, expectancy, folds |
 | Multi-pair walk-forward | `bun run walkforward --tf D1 --data data/Y_USDJPY_D1.json --label Y_USDJPY --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher` | per-symbol OOS folds |
 | Regime-gated walk-forward | add `--regime-gate` to the command above | gate choice / skipped-regime lines |
@@ -120,8 +126,9 @@ Reward           = tanh((PnL_R - cost_R) / 2) * size   (risk-normalized)
   (2) behavior cloning of the actor from the audited contrarian teacher,
   (3) anchored DDPG fine-tuning with a frozen encoder by default.
 - Gradients are exact (numerically checked with `bun run gradcheck`).
-- Costs: spread from the data file (`spread * point`, ~1 pip for the bundled
-  EURUSD file) is charged on every simulated trade and in the training reward.
+- Costs: spread from the data file plus 0.5 bps commission/side, 0.5 bps
+  slippage/side, and rate-differential carry/financing (from `data/macro/`) are
+  charged on every simulated trade and in the training reward.
 - Split: first 80% of the selected file for training, last 20% for evaluation.
   Feature standardization uses training-region statistics only. Walk-forward
   runs move this boundary per fold and retrain from scratch.
@@ -171,6 +178,30 @@ Use `--data data/Y_USDJPY_D1.json` and a `--label` to keep checkpoints separate.
 `bun run audit` automatically picks up every `data/EURUSD_*.json`; pass
 `--data` explicitly for the Yahoo files.
 
+`bun run fetch-macro` downloads rates and macro/cross-asset series from FRED
+into `data/macro/`:
+
+| Group | Series |
+|---|---|
+| 3-month rates (carry) | `IR3TIB01{US,EZ,GB,JP,AU,CA,CH,NZ}M156N` for USD/EUR/GBP/JPY/AUD/CAD/CHF/NZD |
+| Cross-asset | DXY (`DTWEXBGS`), VIX (`VIXCLS`), US 10y/2y (`DGS10`,`DGS2`), WTI (`DCOILWTICO`) |
+| Gold | Yahoo `GC=F` |
+
+All joins are lagged: monthly rates use the previous month, daily macros use the
+previous day. `utils/macro.js` exposes `carryAnnual()` and `macroValue()`.
+
+**Coverage:** macro history is shorter than some price files (DXY starts in
+2006; most other series are earlier). The feature builder finds the first bar
+where every macro input is valid and shifts the model's usable state start to
+that bar. With `--data-points 5000`, the trimmed window starts around 2006-2007,
+so coverage is complete. It never back-fills before coverage starts. The WTI
+negative-price episode in April 2020 is handled as a neutral oil return and
+sparse gaps are forward-filled only after the first valid bar.
+
+Costs in the simulator: spread from the data, `--commission` (default 0.5 bps
+per side), `--slippage` (default 0.5 bps per side), and carry/financing from the
+rate differential (`--no-carry` to disable).
+
 ## Install and verify
 
 ```bash
@@ -196,6 +227,7 @@ bun run train --no-bc --no-pretrain --prefix plain_ddpg
 | `--hidden` | LSTM / critic hidden size (default 32) |
 | `--bars` | Override `barsPredicted` (trade horizon in bars) |
 | `--range-window` | Override bars used for the volatility-based SL/TP distance |
+| `--feature-set` | `price`, `price+macro`, or `macro` (default `price`) |
 | `--features` | Comma-separated override of the feature list |
 | `--data-points` | Limit trailing bars used (default: full file) |
 | `--pretrain-epochs`, `--pretrain-steps` | Encoder pretraining (0 = skip) |
@@ -216,6 +248,9 @@ bun run train --no-bc --no-pretrain --prefix plain_ddpg
 | `--test-end` | End fraction of the evaluation block (default 1.0) |
 | `--embargo` | Gap in bars between train and test (default = `barsPredicted`) |
 | `--gate-feature`, `--gate-min`, `--gate-max` | Regime gate: trade only inside a standardized feature band |
+| `--commission`, `--slippage` | Per-side cost fractions (defaults 0.00005 each = 0.5 bps) |
+| `--no-carry` | Disable rate-differential financing |
+| `--symbol` | Override the inferred pair (for rate/carry lookup) |
 
 | Profile | File | Bars | Horizon | Range window | Teacher |
 |---|---|---|---|---|---|
@@ -300,7 +335,8 @@ Results are written to `backtest_results/` (gitignored) as
 - **Expectancy**: mean `netR` per trade.
 - **Profit factor**: gross winning PnL / gross losing PnL.
 - **Total return / CAGR**: compounded equity from position-sized trade PnL minus
-  spread. Years and CAGR use the file's `period` (intraday aware).
+  spread, commission, slippage, and carry/financing. Years and CAGR use the
+  file's `period` (intraday aware).
 - **Max drawdown**: peak-to-trough on that equity curve.
 - **Sharpe (per trade)**: mean/std of trade returns times `sqrt(trades)`.
 - **Folds**: the evaluation period is split into contiguous blocks; each fold's
@@ -501,6 +537,55 @@ value over holding everything, but it is noisy:
   alignment, spread-only costs, and no out-of-sample confirmation of the
   selection rule.
 
+### Corrected go/no-go: price+macro (costs + carry)
+
+An earlier cost-aware run was invalid: when `--data-points` trimmed `normalized`,
+features were still built on the full file, so state and execution indices were
+offset. This is fixed: price and macro features are now built on the same
+trimmed window, macro coverage starts at the first fully valid bar, and the WTI
+negative-price episode (April 2020) is neutralized with a documented forward-fill
+after the first valid macro bar.
+
+Data: 16 pairs, last 5,000 bars (~2006+, which is when the DXY series starts),
+5 expanding folds from 0.4, 3 seeds, costs = spread + 0.5 bps commission/side +
+0.5 bps slippage/side + rate-differential carry. Model state uses the 21-feature
+`price+macro` set; teacher selection remains the frozen price-feature rule.
+
+| Basket | Total | Positive folds | Last fold |
+|---|---|---|---|
+| Eligible (training-only) | +2.77% | 2/5 | -1.50% |
+| All symbols | +5.19% | 3/5 | -1.07% |
+| Test-fitted oracle (not achievable) | - | - | - |
+
+Pre-registered gate: total > 0, >=4/5 positive folds, last fold >= 0, >=2
+symbols selected.
+
+**VERDICT: NO-GO** (2/5 positive folds, last fold -1.50%).
+
+Notable: selection underperformed holding all symbols. GBPJPY (+20.78%, 5/5) and
+USDJPY were never eligible; EURAUD (+16.68%) was selected but only 4/5 positive.
+The final fold has been observed before, so this is confirmatory, not a pristine
+holdout.
+
+### Macro/carry signal audit (16 pairs, h=20, 5 folds)
+
+| Feature | Avg IC | Avg stability | Qualifying symbols | Top symbol |
+|---|---|---|---|---|
+| carry | -0.060 | 0.76 | 10/16 | AUDJPY (-0.176) |
+| vixLevel | 0.032 | 0.75 | 7/16 | AUDUSD (0.206) |
+| vixChange5 | 0.016 | 0.75 | 7/16 | EURCHF (0.064) |
+| carryMom20 | -0.026 | 0.69 | 4/16 | AUDUSD (-0.119) |
+| dxyRet20 | -0.020 | 0.62 | 2/16 | GBPJPY (-0.067) |
+| oilRet20 | 0.022 | 0.64 | 2/16 | USDJPY (0.078) |
+| slope2s10 | -0.012 | 0.61 | 0/16 | CADJPY (-0.061) |
+| goldRet20 | 0.003 | 0.70 | 5/16 | USDCAD (0.065) |
+
+Carry and VIX have materially stronger and more stable IC than the price-only
+features. They are now integrated as the `price+macro` feature set and were
+tested under the cost-aware gate above. The gate result is **NO-GO**: stronger
+univariate IC did not survive selection, costs, and walk-forward. Per the
+pre-registration, stop here rather than adding more filters.
+
 **Anchored DDPG fine-tune** (H1, 3-fold protocol, 10 epochs x 25 steps, 2 seeds):
 
 | Dataset | Fold returns | Total | Positive folds | Fold max DD |
@@ -534,7 +619,12 @@ What this means:
   detect GBPUSD because its training baseline is optimistic.
 - Training-only universe selection improves on holding everything (+1.91% vs
   -2.50% basket) but is noisy: it missed most of USDJPY's profitable folds and
-  admitted losing symbols. It is a useful screen, not yet a portfolio rule.
+  admitted losing symbols.
+- Under realistic costs the basket is +0.53% with 2/5 positive folds and a
+  negative last fold: the pre-registered gate is **NO-GO**. The price-only model
+  is not ready to trade.
+- Macro carry/VIX features have stronger IC than the price-only set. That is the
+  next lever; more price-only tuning is not.
 - Anchored DDPG is not additive: +0.75% over 3 folds with 1/3 positive folds and
   a -11.4% drawdown in one fold.
 - Unrestricted DDPG earlier collapsed to constant direction; BC plus per-fold
@@ -551,37 +641,45 @@ bun run walkforward --tf H4 --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --sel
 bun run fetch-data
 bun run walkforward --tf D1 --data data/Y_USDJPY_D1.json --label Y_USDJPY --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher
 bun run walkforward --tf D1 --data data/Y_AUDUSD_D1.json --label Y_AUDUSD --folds 5 --start 0.4 --seeds 1,2,3 --epochs 0 --select-teacher --regime-gate
+
+# Pre-registered macro gate (split into two batches to fit compute limits)
+bun run fetch-macro
+bun run universe --symbols EURUSD,GBPUSD,USDJPY,AUDUSD,USDCAD,USDCHF,NZDUSD,EURGBP \
+  --feature-set price+macro --folds 5 --start 0.4 --seeds 1,2,3 \
+  --data-points 5000 --concurrency 6 --tag A
+bun run universe --symbols EURJPY,GBPJPY,EURCHF,EURAUD,EURCAD,AUDJPY,CADJPY,CHFJPY \
+  --feature-set price+macro --folds 5 --start 0.4 --seeds 1,2,3 \
+  --data-points 5000 --concurrency 6 --tag B
 ```
 
 ## Known limitations / next steps
 
-1. **The next step is a pre-registered go/no-go, not more tuning**: the
-   training-only universe basket is implemented and beats the all-symbol basket
-   (+1.91% vs -2.50%) but is noisy. Freeze the rule now, add realistic
-   commission/slippage, and validate on a period not used for any selection.
-   Acceptance example: positive in >=4/5 OOS folds across >=3 seeds and a
-   drawdown/turnover budget. If it fails, stop instead of adding filters.
-2. **Regime gating is not solved**: forced gates can rescue a weak pair but break
+1. **Both go/no-go tests are NO-GO**: the earlier price-only cost run was
+   invalidated by the data-points index bug; after fixing alignment, the
+   macro-augmented basket is +2.77% with 2/5 positive folds and a -1.50% last
+   fold. Per the pre-registration, stop. Do not trade or keep tuning.
+2. **Macro/carry was the last pre-registered lever and it failed**: stronger
+   univariate IC did not survive selection, costs, and walk-forward. Do not add
+   more filters to rescue it. A new attempt requires a new hypothesis, a new
+   untouched instrument set, or fresh data.
+3. **Regime gating is not solved**: forced gates can rescue a weak pair but break
    a working one; the selective rule overfits the training baseline (GBPUSD).
    Treat gating as research only until it passes the same held-out gate.
-3. **Policy learning**: BC is the best policy; anchored DDPG is not reliably
+4. **Policy learning**: BC is the best policy; anchored DDPG is not reliably
    additive. Keep `bc_model` as the reference and only change the RL layer after
-   pair selection is stable.
-4. **Signal**: the audited edge is modest and contrarian around ~20 days. Keep
-   the feature/teacher set pre-registered; adding indicators without an audit
-   will overfit.
+   the signal problem is solved.
 5. **Data**: 16 daily pairs are fetched and screened, but folds are only
-   approximately aligned (all end on the same date, different calendars) and the
-   universe run used 2 seeds. More history and exact date alignment are needed
-   before treating the basket as a portfolio.
+   approximately aligned (all end on the same date, different calendars). The
+   macro gate used 3 seeds, but exact date alignment and more history are still
+   needed before treating the basket as a portfolio.
 6. **Reward**: risk-normalized R is implemented, but portfolio drawdown,
    turnover, and slippage beyond the spread are not. Add them if the policy
    over-trades.
 7. **Compute**: pure JS BPTT is correct but slow. Vectorized/typed-array math
    would enable larger walk-forward sweeps.
-8. **Validation**: model selection still uses a slice of the training region.
-   Rolling walk-forward validation and seed ensembles are the preferred
-   protocol.
+8. **Validation**: no pristine holdout remains on this dataset; the final folds
+   have been observed during development. A clean test needs new data or an
+   untouched instrument set.
 9. **Determinism**: `--seed` covers weight init, replay sampling, and
    exploration, but not OS threading/number formatting.
 
@@ -607,10 +705,14 @@ walkforward.js          # expanding-window retraining + per-fold ensembles/gates
 universe.js             # training-only per-fold symbol selection + basket
 sweep.js                # multi-seed train + backtest comparison
 fetchYahoo.js           # downloads multi-pair daily OHLC from Yahoo Finance
+fetchMacro.js           # downloads rates/carry and macro series from FRED
+macroAudit.js           # carry/VIX/DXY/yields/oil/gold IC audit
 signalAudit.js          # walk-forward feature IC/stability/hit-rate audit
 gradcheck.js            # finite-difference gradient verification
 utils/nn.js             # Dense, activations, Adam, soft updates
 utils/features.js       # causal feature factory + rank/IC helpers
+utils/macro.js          # lagged rate/carry and macro lookups
+utils/macroFeatures.js  # per-bar carry/VIX/DXY/yields/oil/gold features
 utils/dataProcessor.js  # normalization, features, windows, price ranges
 utils/rng.js            # seeded RNG + Gaussian sampler
 models/lstm.js          # recurrent encoder, truncated BPTT

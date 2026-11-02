@@ -187,7 +187,7 @@ async function run() {
             continue;
         }
 
-        const netPnl = trade.size * (trade.pnlPct - trade.costPct);
+        const netPnl = trade.size * trade.netPct;
         trades.push({
             index,
             direction: trade.direction,

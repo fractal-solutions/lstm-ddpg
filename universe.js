@@ -12,6 +12,7 @@ import { mkdir, readdir, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { buildFeatureMatrix, rank, pearson, FEATURE_META } from './utils/features.js';
 import { DEFAULT_CONFIG } from './main.js';
+import { loadRates, carryAnnual, dateFromTimestamp, pairCurrencies } from './utils/macro.js';
 
 const ROOT = import.meta.dir;
 const RESULTS_DIR = join(ROOT, 'backtest_results');
@@ -94,7 +95,7 @@ function selectTeacher(featureData, horizon, trainEndFraction, allowed, folds = 
 }
 
 // Eligibility uses training data only.
-function trainingEligibility(featureData, horizon, trainEndFraction, spreadPrice, folds = 5) {
+function trainingEligibility(featureData, times, horizon, trainEndFraction, spreadPrice, costs, folds = 5) {
     const teacher = selectTeacher(featureData, horizon, trainEndFraction, new Set(DEFAULT_CONFIG.featureNames), folds);
     if (!teacher) return { eligible: false, reason: 'no-teacher' };
 
@@ -111,7 +112,12 @@ function trainingEligibility(featureData, horizon, trainEndFraction, spreadPrice
         const t = start + i;
         const direction = teacher.sign * Math.sign(matrix[t][teacherIndex]);
         const forward = Math.log(close[t + horizon] / close[t]);
-        net[i] = direction * forward - spreadPrice / close[t];
+        const extraCost = 2 * costs.slippagePct + 2 * costs.commissionPct;
+        const annual = costs.useCarry
+            ? (carryAnnual(costs.rates, costs.base, costs.quote, dateFromTimestamp(times[t])) ?? 0)
+            : 0;
+        const carryPct = direction * annual * horizon / 252;
+        net[i] = direction * forward - spreadPrice / close[t] - extraCost + carryPct;
     }
 
     let total = 0;
@@ -141,11 +147,21 @@ const startFraction = Number(args.start ?? 0.4);
 const seeds = String(args.seeds ?? '1,2').split(',').map(Number).filter(Number.isFinite);
 const dataPoints = Number(args['data-points'] ?? 5000);
 const concurrency = Math.max(1, Number(args.concurrency ?? 4));
+const tag = args.tag ? String(args.tag) : '';
+const featureSet = String(args['feature-set'] ?? 'price');
+const featureSetArgs = args['feature-set'] ? ['--feature-set', featureSet] : [];
 const modelDir = join(process.env.TEMP ?? process.env.TMPDIR ?? '/tmp', 'lstm-ddpg-universe-models');
 
 const step = (1 - startFraction) / folds;
 const modelSuffix = 'bc_model';
 const allowed = new Set(DEFAULT_CONFIG.featureNames);
+const rates = await loadRates();
+const costConfig = {
+    slippagePct: DEFAULT_CONFIG.slippagePct,
+    commissionPct: DEFAULT_CONFIG.commissionPct,
+    useCarry: DEFAULT_CONFIG.useCarry,
+    rates
+};
 
 await mkdir(RESULTS_DIR, { recursive: true });
 for (const name of await readdir(RESULTS_DIR)) {
@@ -172,6 +188,7 @@ async function runSymbol(symbol) {
         '--epochs', '0',
         '--select-teacher',
         '--data-points', String(dataPoints),
+        ...featureSetArgs,
         '--model-dir', modelDir
     ];
 
@@ -185,11 +202,26 @@ async function runSymbol(symbol) {
     const data = trimData(await Bun.file(join(ROOT, 'data', `Y_${symbol}_D1.json`)).json(), dataPoints);
     const featureData = buildFeatureMatrix(data);
 
+    const pair = pairCurrencies(symbol);
+    const costs = {
+        ...costConfig,
+        base: pair?.base ?? null,
+        quote: pair?.quote ?? null
+    };
+
     const eligibility = [];
     for (let fold = 0; fold < folds; fold++) {
         const trainFraction = startFraction + fold * step;
         eligibility.push(
-            trainingEligibility(featureData, 20, trainFraction, (data.spread ?? 0) * (data.point ?? 0.00001), 5)
+            trainingEligibility(
+                featureData,
+                data.time,
+                20,
+                trainFraction,
+                (data.spread ?? 0) * (data.point ?? 0.00001),
+                costs,
+                5
+            )
         );
     }
 
@@ -207,12 +239,12 @@ async function worker() {
         try {
             results.push(await runSymbol(symbol));
         } catch (error) {
-            console.error(`  ${symbol.padEnd(7)} FAILED: ${error.message.split('\n')[0]}`);
+            console.error(`  ${symbol.padEnd(7)} FAILED: ${error.message}`);
         }
     }
 }
 
-console.log(`Universe: ${symbols.length} symbols, ${folds} folds, seeds ${seeds.join(',')}, concurrency ${concurrency}\n`);
+console.log(`Universe: ${symbols.length} symbols, ${folds} folds, seeds ${seeds.join(',')}, features ${featureSet}, concurrency ${concurrency}\n`);
 await Promise.all(Array.from({ length: Math.min(concurrency, symbols.length) }, worker));
 
 results.sort((a, b) => a.symbol.localeCompare(b.symbol));
@@ -238,6 +270,7 @@ let basketPositive = 0;
 let allEquity = 1;
 const basketReturns = [];
 const allReturns = [];
+const selectedCounts = [];
 
 for (let fold = 0; fold < folds; fold++) {
     const selected = results.filter(result => result.eligibility[fold]?.eligible);
@@ -253,6 +286,7 @@ for (let fold = 0; fold < folds; fold++) {
     if (basketReturn > 0) basketPositive++;
     basketReturns.push(basketReturn);
     allReturns.push(allReturn);
+    selectedCounts.push(selected.length);
 
     console.log(
         `${String(fold + 1).padEnd(5)} ${String(selected.length).padStart(8)}  ` +
@@ -276,14 +310,33 @@ console.log(
     `${(oracle.reduce((sum, value) => sum + value, 0) / Math.max(1, oracle.length)).toFixed(2)}%`
 );
 
+const basketTotal = (basketEquity - 1) * 100;
+const lastFoldReturn = basketReturns[basketReturns.length - 1] ?? 0;
+const averageSelected = selectedCounts.reduce((sum, value) => sum + value, 0) / Math.max(1, selectedCounts.length);
+const acceptFolds = Number(args['accept-folds'] ?? 4);
+const reasons = [];
+if (basketTotal <= 0) reasons.push('basket total <= 0');
+if (basketPositive < acceptFolds) reasons.push(`positive folds ${basketPositive}/${folds} < ${acceptFolds}`);
+if (lastFoldReturn < 0) reasons.push(`last fold ${lastFoldReturn.toFixed(2)}% < 0`);
+if (averageSelected < 2) reasons.push(`average selected symbols ${averageSelected.toFixed(1)} < 2`);
+
+const verdict = reasons.length === 0 ? 'GO' : 'NO-GO';
+console.log(`\nCost assumptions: spread from data, commission=${(DEFAULT_CONFIG.commissionPct * 1e4).toFixed(1)}bps/side, ` +
+    `slippage=${(DEFAULT_CONFIG.slippagePct * 1e4).toFixed(1)}bps/side, carry=${DEFAULT_CONFIG.useCarry ? 'on' : 'off'}`);
+console.log(`Pre-registered gate: total>0, >=${acceptFolds}/${folds} positive folds, last fold>=0, >=2 symbols selected.`);
+console.log(`VERDICT: ${verdict}${reasons.length ? ` (${reasons.join('; ')})` : ''}`);
+console.log('Caveat: the final fold has been observed before; treat this as confirmatory, not a pristine holdout.');
+
 const summaryPath = join(
     RESULTS_DIR,
-    `universe_s${seeds.length}_f${folds}_st${startFraction}_d${dataPoints}.json`
+    `universe_${featureSet.replace('+', 'plus')}${tag ? '_' + tag : ''}_s${seeds.length}_f${folds}_st${startFraction}_d${dataPoints}.json`
 );
 await Bun.write(summaryPath, JSON.stringify({
     symbols,
     folds,
     seeds,
+    featureSet,
+    tag,
     startFraction,
     dataPoints,
     results: results.map(result => ({
@@ -299,9 +352,20 @@ await Bun.write(summaryPath, JSON.stringify({
         }))
     })),
     basketReturns,
-    basketTotal: (basketEquity - 1) * 100,
+    basketTotal,
     allReturns,
-    allTotal: (allEquity - 1) * 100
+    allTotal: (allEquity - 1) * 100,
+    selectedCounts,
+    averageSelected,
+    lastFoldReturn,
+    acceptFolds,
+    verdict,
+    reasons,
+    costs: {
+        commissionPct: DEFAULT_CONFIG.commissionPct,
+        slippagePct: DEFAULT_CONFIG.slippagePct,
+        useCarry: DEFAULT_CONFIG.useCarry
+    }
 }, null, 2));
 console.log(`\nWrote ${summaryPath.replace(ROOT + '\\', '')}`);
 
