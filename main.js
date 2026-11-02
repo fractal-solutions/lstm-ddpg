@@ -49,6 +49,10 @@ export const DEFAULT_CONFIG = {
     // keep the pretrained/BC encoder frozen by default.
     bcAnchor: 1.0,
     freezeEncoderAfterBc: true,
+    // Optional regime gate on a standardized feature: trade only inside the band.
+    gateFeature: null,
+    gateMin: null,
+    gateMax: null,
     // Fine-tuning the pretrained encoder slowly avoids destroying it.
     encoderLr: 1e-4,
     actorLr: 1e-3,
@@ -95,6 +99,9 @@ export function resolveConfig(args = {}) {
     if (args['train-fraction']) config.trainFraction = Number(args['train-fraction']);
     if (args['test-end']) config.testEndFraction = Number(args['test-end']);
     if (args.embargo !== undefined) config.embargoBars = Number(args.embargo);
+    if (args['gate-feature']) config.gateFeature = String(args['gate-feature']);
+    if (args['gate-min'] !== undefined) config.gateMin = Number(args['gate-min']);
+    if (args['gate-max'] !== undefined) config.gateMax = Number(args['gate-max']);
     return config;
 }
 
@@ -145,6 +152,9 @@ export class TradingSystem {
         this.encoderHead = null;
         this.anchorActor = null;
         this.freezeEncoder = false;
+        this.gate = this.config.gateFeature
+            ? { feature: this.config.gateFeature, min: this.config.gateMin, max: this.config.gateMax }
+            : null;
         this.stateGain = 1;
         this.noiseSigma = cfg.noiseSigma;
         this.ouState = new Array(cfg.actionSize).fill(0);
@@ -234,10 +244,30 @@ export class TradingSystem {
         }
     }
 
+    isGateActive(state) {
+        if (!this.gate) return true;
+        const index = this.config.featureNames.indexOf(this.gate.feature);
+        if (index === -1) return true;
+        const value = state[state.length - 1][index];
+        return value >= this.gate.min && value <= this.gate.max;
+    }
+
     predict(state, addNoise = false, quiet = false) {
         this.validateState(state);
 
         const features = this.encode(state);
+        if (this.gate && !addNoise && !this.isGateActive(state)) {
+            return {
+                positionSize: 0,
+                direction: 0,
+                size: 0,
+                stopLossFrac: 0.5,
+                takeProfitFrac: 0.5,
+                actionVector: [0, 0.5, 0.5, 0.5],
+                features,
+                gated: true
+            };
+        }
         const policy = this.ddpg.policyForward(features);
         const vector = addNoise ? this.applyExplorationNoise(policy.vector) : [...policy.vector];
         const [direction, size, stopLossFrac, takeProfitFrac] = vector;
@@ -492,15 +522,28 @@ export class TradingSystem {
                     try {
                         const state = await this.dataProcessor.getState(index);
                         const teacherValue = state[state.length - 1][teacherIndex];
-                        const target = sign * Math.sign(teacherValue);
-                        if (target === 0) continue;
+                        const active = this.isGateActive(state);
+                        let target;
+                        let countAccuracy = false;
+
+                        if (active) {
+                            target = sign * Math.sign(teacherValue);
+                            if (target === 0) continue;
+                            countAccuracy = true;
+                        } else {
+                            // Outside the regime gate the cloned policy learns to stay flat.
+                            if (!this.gate) continue;
+                            target = 0;
+                        }
 
                         const policy = this.ddpg.policyForward(this.encode(state));
                         const predicted = policy.direction;
 
-                        if (Math.sign(predicted) === target) correct++;
+                        if (countAccuracy) {
+                            if (Math.sign(predicted) === target) correct++;
+                            total++;
+                        }
                         squaredError += (predicted - target) ** 2;
-                        total++;
 
                         const dDirection = (predicted - target) / batchSize;
                         this.ddpg.policyBackward([dDirection, 0, 0, 0], true);
@@ -833,6 +876,7 @@ export class TradingSystem {
                 embargo: this.embargo,
                 freezeEncoder: this.freezeEncoder,
                 bcAnchor: this.config.bcAnchor,
+                gate: this.gate,
                 testStart: this.testStart,
                 stateGain: this.stateGain,
                 seed: this.config.seed,
@@ -891,6 +935,9 @@ export class TradingSystem {
         copyParams(this.targetLstm.parameters(), this.lstm.parameters());
         copyParams(this.targetDdpg.allParameters(), this.ddpg.allParameters());
         this.stateGain = modelData.meta?.stateGain ?? 1;
+        if (!this.config.gateFeature && modelData.meta?.gate) {
+            this.gate = modelData.meta.gate;
+        }
         if (Number.isFinite(modelData.meta?.spreadPrice)) this.spreadPrice = modelData.meta.spreadPrice;
 
         return modelData;

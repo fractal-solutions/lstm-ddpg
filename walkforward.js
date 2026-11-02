@@ -3,22 +3,22 @@
 // on the next contiguous block, then evaluate the seed ensemble on that block.
 // No future data is used for training or feature standardization.
 
-import { join } from 'node:path';
+import { join, basename, extname } from 'node:path';
 import { buildFeatureMatrix, rank, pearson, FEATURE_META } from './utils/features.js';
-import { TIMEFRAMES } from './main.js';
+import { TIMEFRAMES, DEFAULT_CONFIG } from './main.js';
 
 const ROOT = import.meta.dir;
 
 // Select the teacher using only the training window for this fold.
-function selectTeacher(data, horizon, trainEndFraction, folds = 5) {
-    const { matrix, featureNames, warmup, n, close } = buildFeatureMatrix(data);
+function selectTeacher(featureData, horizon, trainEndFraction, folds = 5, allowed = null) {
+    const { matrix, featureNames, warmup, n, close } = featureData;
     const trainEnd = Math.floor(n * trainEndFraction);
     const start = warmup;
     const end = trainEnd - horizon;
     if (end - start < folds * 100) return null;
 
     const size = Math.floor((end - start) / folds);
-    const candidates = featureNames.filter(name => FEATURE_META[name].signed);
+    const candidates = featureNames.filter(name => FEATURE_META[name].signed && (!allowed || allowed.has(name)));
     const results = [];
 
     for (const name of candidates) {
@@ -49,13 +49,95 @@ function selectTeacher(data, horizon, trainEndFraction, folds = 5) {
     return qualified ?? results[0] ?? null;
 }
 
+// Select a regime band using only the training window for this fold.
+// Gate thresholds are in standardized feature units (same scale the model sees).
+function selectRegimeGate(featureData, teacher, horizon, trainEndFraction, spreadPrice, folds = 5) {
+    const { matrix, featureNames, warmup, n, close } = featureData;
+    const trainEnd = Math.floor(n * trainEndFraction);
+    const start = warmup;
+    const end = trainEnd - horizon;
+    if (end - start < 1000) return null;
+
+    const teacherIndex = featureNames.indexOf(teacher.feature);
+    if (teacherIndex === -1) return null;
+
+    const length = end - start;
+    const net = new Float64Array(length);
+    for (let i = 0; i < length; i++) {
+        const t = start + i;
+        const direction = teacher.sign * Math.sign(matrix[t][teacherIndex]);
+        const forward = Math.log(close[t + horizon] / close[t]);
+        const cost = spreadPrice / close[t];
+        net[i] = direction * forward - cost;
+    }
+
+    const meanOf = (values) => values.length ? values.reduce((a, b) => a + b, 0) / values.length : 0;
+    const stabilityOf = (indices) => {
+        const blockSize = Math.max(1, Math.floor(length / folds));
+        let positive = 0;
+        let used = 0;
+        for (let block = 0; block < folds; block++) {
+            const from = block * blockSize;
+            const to = block === folds - 1 ? length : (block + 1) * blockSize;
+            const values = [];
+            for (const i of indices) if (i >= from && i < to) values.push(net[i]);
+            if (values.length < 5) continue;
+            used++;
+            if (meanOf(values) > 0) positive++;
+        }
+        return used ? positive / used : 0;
+    };
+
+    const baseline = meanOf([...net]);
+    const candidates = ['atrRel', 'volRatio', 'rangeRatio', 'shock', 'ret60z', 'dist50', 'slope20']
+        .filter(name => featureNames.includes(name));
+
+    let best = null;
+    for (const name of candidates) {
+        const index = featureNames.indexOf(name);
+        const trainValues = [];
+        for (let t = warmup; t < trainEnd; t++) trainValues.push(matrix[t][index]);
+        const mean = meanOf(trainValues);
+        const variance = trainValues.reduce((sum, value) => sum + (value - mean) ** 2, 0) / trainValues.length;
+        const std = Math.sqrt(variance) || 1e-8;
+
+        const z = new Float64Array(length);
+        for (let i = 0; i < length; i++) z[i] = (matrix[start + i][index] - mean) / std;
+
+        const sorted = [...z].sort((a, b) => a - b);
+        const edges = [0, 0.2, 0.4, 0.6, 0.8, 1].map(q => sorted[Math.min(sorted.length - 1, Math.floor(q * (sorted.length - 1)))]);
+
+        for (let band = 0; band < 5; band++) {
+            const min = edges[band];
+            const max = edges[band + 1];
+            const indices = [];
+            for (let i = 0; i < length; i++) {
+                if (z[i] >= min && z[i] <= max) indices.push(i);
+            }
+            if (indices.length < 200) continue;
+            const meanNet = meanOf(indices.map(i => net[i]));
+            const stability = stabilityOf(indices);
+            if (stability < 0.6) continue;
+            if (best === null || meanNet > best.meanNet) {
+                best = { feature: name, min, max, meanNet, stability, count: indices.length };
+            }
+        }
+    }
+
+    // Selective gating: do not gate a signal that is already positive in training.
+    if (baseline > 0) return { active: false, baseline, reason: 'baseline-positive' };
+    if (!best || best.meanNet <= baseline) return { active: false, baseline, reason: 'no-improvement' };
+    return { active: true, ...best, baseline };
+}
+
 function parseArgs(argv) {
     const options = {};
     for (let i = 0; i < argv.length; i++) {
         const arg = argv[i];
         if (!arg.startsWith('--')) continue;
         const key = arg.slice(2);
-        if (key === 'no-pretrain' || key === 'no-bc' || key === 'no-freeze-encoder') {
+        if (key === 'no-pretrain' || key === 'no-bc' || key === 'no-freeze-encoder' ||
+            key === 'select-teacher' || key === 'regime-gate') {
             options[key] = true;
             continue;
         }
@@ -111,9 +193,17 @@ const modelSuffix = epochs === 0 ? 'bc_model' : 'best_model';
 const profile = TIMEFRAMES[tf];
 if (!profile) throw new Error(`Unknown timeframe "${tf}"`);
 const selectPerFold = args['select-teacher'] === true;
-const data = selectPerFold ? await Bun.file(profile.dataPath).json() : null;
+const selectGate = args['regime-gate'] === true;
+const dataPath = args.data ? String(args.data) : profile.dataPath;
+const label = String(args.label ?? (args.data ? basename(dataPath, extname(dataPath)) : tf));
+const needsSelection = selectPerFold || selectGate;
+const data = needsSelection ? await Bun.file(dataPath).json() : null;
+const featureData = needsSelection ? buildFeatureMatrix(data) : null;
+const spreadPrice = data ? (data.spread ?? 0) * (data.point ?? 0.00001) : 0;
+const dataArgs = args.data ? ['--data', String(args.data)] : [];
+const allowedTeachers = new Set(DEFAULT_CONFIG.featureNames);
 
-const trainArgs = ['bun', 'run', 'main.js', '--tf', tf];
+const trainArgs = ['bun', 'run', 'main.js', '--tf', tf, ...dataArgs];
 for (const key of ['epochs', 'steps', 'batch', 'hidden', 'pretrain-epochs', 'pretrain-steps', 'bc-epochs', 'bc-steps', 'bc-anchor']) {
     if (args[key] !== undefined) trainArgs.push(`--${key}`, String(args[key]));
 }
@@ -122,7 +212,11 @@ if (args['no-bc']) trainArgs.push('--no-bc');
 if (args['no-freeze-encoder']) trainArgs.push('--no-freeze-encoder');
 const embargoArgs = args.embargo !== undefined ? ['--embargo', String(args.embargo)] : [];
 
-console.log(`Walk-forward ${tf}: ${folds} folds, ${seeds.length} seeds, start=${startFraction}, model=${modelSuffix}${args.embargo !== undefined ? `, embargo=${args.embargo}` : ''}\n`);
+console.log(
+    `Walk-forward ${label}: ${folds} folds, ${seeds.length} seeds, start=${startFraction}, ` +
+    `model=${modelSuffix}${args.embargo !== undefined ? `, embargo=${args.embargo}` : ''}` +
+    `${selectPerFold ? ', select-teacher' : ''}${selectGate ? ', regime-gate' : ''}\n`
+);
 console.log('fold  train   test    seedRet%  ensRet%   ensPF    ensTrades  ensDD%');
 
 const foldResults = [];
@@ -139,7 +233,7 @@ for (let fold = 0; fold < folds; fold++) {
     let teacherArgs = [];
     let teacherSelection = null;
     if (selectPerFold) {
-        teacherSelection = selectTeacher(data, profile.barsPredicted, trainFraction);
+        teacherSelection = selectTeacher(featureData, profile.barsPredicted, trainFraction, 5, allowedTeachers);
         if (teacherSelection) {
             teacherArgs = [
                 '--teacher', teacherSelection.feature,
@@ -153,13 +247,45 @@ for (let fold = 0; fold < folds; fold++) {
         }
     }
 
+    let gateArgs = [];
+    let gateSelection = null;
+    if (selectGate && featureData) {
+        const teacher = teacherSelection ?? { feature: profile.teacherFeature, sign: -1 };
+        gateSelection = selectRegimeGate(
+            featureData,
+            teacher,
+            profile.barsPredicted,
+            trainFraction,
+            spreadPrice
+        );
+        if (gateSelection?.active) {
+            gateArgs = [
+                '--gate-feature', gateSelection.feature,
+                '--gate-min', String(gateSelection.min),
+                '--gate-max', String(gateSelection.max)
+            ];
+            console.log(
+                `  fold ${fold + 1} gate: ${gateSelection.feature} ` +
+                `[${gateSelection.min.toFixed(2)}, ${gateSelection.max.toFixed(2)}] ` +
+                `trainRet=${(gateSelection.meanNet * 1e4).toFixed(1)}bps ` +
+                `stability=${gateSelection.stability.toFixed(2)} n=${gateSelection.count}`
+            );
+        } else if (gateSelection) {
+            console.log(
+                `  fold ${fold + 1} gate skipped (${gateSelection.reason}), ` +
+                `train baseline=${(gateSelection.baseline * 1e4).toFixed(1)}bps`
+            );
+        }
+    }
+
     for (const seed of seeds) {
-        const prefix = `${tf.toLowerCase()}_wf${fold + 1}_s${seed}`;
+        const prefix = `${label.toLowerCase()}_wf${fold + 1}_s${seed}`;
         prefixes.push(prefix);
 
         run([
             ...trainArgs,
             ...teacherArgs,
+            ...gateArgs,
             ...embargoArgs,
             '--train-fraction', String(trainFraction),
             '--test-end', String(testEnd),
@@ -170,7 +296,9 @@ for (let fold = 0; fold < folds; fold++) {
         const individual = parseMetrics(run([
             'bun', 'run', 'backtest.js',
             '--tf', tf,
+            ...dataArgs,
             '--model', `${prefix}_${modelSuffix}`,
+            ...gateArgs,
             ...embargoArgs,
             '--train-fraction', String(trainFraction),
             '--test-end', String(testEnd),
@@ -184,7 +312,9 @@ for (let fold = 0; fold < folds; fold++) {
     const ensemble = parseMetrics(run([
         'bun', 'run', 'backtest.js',
         '--tf', tf,
+        ...dataArgs,
         '--ensemble', prefixes.map(prefix => `${prefix}_${modelSuffix}`).join(','),
+        ...gateArgs,
         ...embargoArgs,
         '--train-fraction', String(trainFraction),
         '--test-end', String(testEnd),
@@ -203,7 +333,15 @@ for (let fold = 0; fold < folds; fold++) {
         `${String(ensemble.trades).padStart(9)}  ${ensemble.maxDrawdown.toFixed(2).padStart(6)}`
     );
 
-    foldResults.push({ fold: fold + 1, trainFraction, testEnd, teacher: teacherSelection, seedReturns, ensemble });
+    foldResults.push({
+        fold: fold + 1,
+        trainFraction,
+        testEnd,
+        teacher: teacherSelection,
+        gate: gateSelection,
+        seedReturns,
+        ensemble
+    });
 }
 
 const totalReturn = (compounded - 1) * 100;
@@ -218,7 +356,7 @@ await mkdir(join(ROOT, 'backtest_results'), { recursive: true });
 const summaryPath = join(
     ROOT,
     'backtest_results',
-    `walkforward_${tf}_${modelSuffix}${selectPerFold ? '_sel' : ''}_s${seeds.length}_f${folds}_st${startFraction}.json`
+    `walkforward_${label}_${modelSuffix}${selectPerFold ? '_sel' : ''}${selectGate ? '_gate' : ''}_s${seeds.length}_f${folds}_st${startFraction}.json`
 );
 await Bun.write(
     summaryPath,

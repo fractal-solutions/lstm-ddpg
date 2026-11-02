@@ -8,6 +8,7 @@
     "gradcheck": "bun run gradcheck.js",
     "sweep": "bun run sweep.js",
     "walkforward": "bun run walkforward.js",
+    "fetch-data": "bun run fetchYahoo.js",
     "audit": "bun run signalAudit.js"
   },
   "devDependencies": {
