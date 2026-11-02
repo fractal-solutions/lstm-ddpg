@@ -56,7 +56,7 @@ const sharedArgs = [];
 for (const key of ['epochs', 'steps', 'batch', 'pretrain-epochs', 'pretrain-steps', 'bc-epochs', 'bc-steps'])  {
     if (args[key] !== undefined) trainArgs.push(`--${key}`, String(args[key]));
 }
-for (const key of ['tf', 'bars', 'range-window', 'features', 'data', 'teacher', 'teacher-sign']) {
+for (const key of ['tf', 'bars', 'range-window', 'features', 'data', 'teacher', 'teacher-sign', 'train-fraction', 'test-end', 'embargo', 'bc-anchor']) {
     if (args[key] !== undefined) sharedArgs.push(`--${key}`, String(args[key]));
 }
 if (args['no-pretrain']) trainArgs.push('--no-pretrain');

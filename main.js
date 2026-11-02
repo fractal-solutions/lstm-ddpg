@@ -27,6 +27,8 @@ export const DEFAULT_CONFIG = {
     batchSize: 16,
     replaySize: 20000,
     trainFraction: 0.8,
+    testEndFraction: null,  // walk-forward: end of the evaluation block (<1)
+    embargoBars: null,      // gap between train and test; default = barsPredicted
     epochs: 30,
     stepsPerEpoch: 50,
     patience: 15,
@@ -43,6 +45,10 @@ export const DEFAULT_CONFIG = {
     bcLr: 1e-3,
     teacherFeature: 'ret1z',
     teacherSign: -1,        // -1 = contrarian, +1 = momentum
+    // Anchored fine-tuning: regularize the actor toward the BC policy and
+    // keep the pretrained/BC encoder frozen by default.
+    bcAnchor: 1.0,
+    freezeEncoderAfterBc: true,
     // Fine-tuning the pretrained encoder slowly avoids destroying it.
     encoderLr: 1e-4,
     actorLr: 1e-3,
@@ -86,6 +92,9 @@ export function resolveConfig(args = {}) {
     if (args['range-window']) config.rangeWindow = Number(args['range-window']);
     if (args['data-points']) config.dataPoints = Number(args['data-points']);
     if (args.features) config.featureNames = String(args.features).split(',');
+    if (args['train-fraction']) config.trainFraction = Number(args['train-fraction']);
+    if (args['test-end']) config.testEndFraction = Number(args['test-end']);
+    if (args.embargo !== undefined) config.embargoBars = Number(args.embargo);
     return config;
 }
 
@@ -134,6 +143,8 @@ export class TradingSystem {
         this.bcOptimizer = new Adam({ lr: cfg.bcLr, clipNorm: cfg.clipNorm });
 
         this.encoderHead = null;
+        this.anchorActor = null;
+        this.freezeEncoder = false;
         this.stateGain = 1;
         this.noiseSigma = cfg.noiseSigma;
         this.ouState = new Array(cfg.actionSize).fill(0);
@@ -157,7 +168,7 @@ export class TradingSystem {
         });
         this.dataProcessor.normalizeData(this.config.dataPoints ?? data.close.length);
         this.initializeSplit();
-        this.dataProcessor.buildFeatures(this.testStart, this.config.featureNames);
+        this.dataProcessor.buildFeatures(this.trainEnd, this.config.featureNames);
 
         const point = Number.isFinite(data.point) ? data.point : 0.00001;
         const spreadPoints = this.config.spreadPoints ?? (Number.isFinite(data.spread) ? data.spread : 0);
@@ -168,17 +179,30 @@ export class TradingSystem {
 
     initializeSplit() {
         const length = this.dataProcessor.normalized.length;
-        this.testStart = Math.floor(length * this.config.trainFraction);
+        this.trainEnd = Math.floor(length * this.config.trainFraction);
+        // Embargo prevents training labels from overlapping the evaluation block.
+        this.embargo = Number.isFinite(this.config.embargoBars)
+            ? this.config.embargoBars
+            : this.barsPredicted;
+        this.testStart = this.trainEnd + this.embargo;
+        this.testEnd = Math.floor(length * (this.config.testEndFraction ?? 1));
+
         const minRequired = this.dataProcessor.lookback + this.barsPredicted + 1;
-        if (this.testStart <= minRequired) {
-            throw new Error(`Not enough data to split train/test (testStart=${this.testStart}, need > ${minRequired})`);
+        if (this.trainEnd <= minRequired) {
+            throw new Error(`Not enough training data (trainEnd=${this.trainEnd}, need > ${minRequired})`);
+        }
+        if (this.testEnd <= this.testStart + this.barsPredicted) {
+            throw new Error(
+                `Empty evaluation block: testStart=${this.testStart}, testEnd=${this.testEnd}, ` +
+                `embargo=${this.embargo}`
+            );
         }
     }
 
     get trainRange() {
         return {
             min: this.dataProcessor.stateStart,
-            max: this.testStart - this.barsPredicted
+            max: this.trainEnd - this.barsPredicted
         };
     }
 
@@ -588,11 +612,17 @@ export class TradingSystem {
             await this.saveModels(modelName('pretrain_model'), { stage: 'pretrain' });
         }
 
+        this.anchorActor = null;
+        this.freezeEncoder = false;
         if (this.config.bcEpochs > 0) {
             await this.behaviorClone();
             if (save) {
                 await this.saveModels(modelName('bc_model'), { stage: 'behavior-clone' });
             }
+            // Freeze a copy of the cloned actor as the anchor for fine-tuning.
+            this.anchorActor = new DDPG(this.config.hiddenSize, this.config.actionSize);
+            copyParams(this.anchorActor.actorParameters(), this.ddpg.actorParameters());
+            this.freezeEncoder = this.config.freezeEncoderAfterBc === true;
         }
 
         console.log(`Training DDPG ${epochs} epochs x ${stepsPerEpoch} steps, batch ${this.batchSize}`);
@@ -738,17 +768,28 @@ export class TradingSystem {
             try {
                 const { hidden } = this.lstm.forward(state);
                 const features = hidden.map(v => v * gain);
-                this.ddpg.policyForward(features); // sets lastPolicy and the actor cache
-                const actionVector = this.ddpg.lastPolicy.vector;
+                const policy = this.ddpg.policyForward(features);
+                const actionVector = policy.vector;
                 this.ddpg.criticForward(features, actionVector);
 
                 const dQ = -1 / N; // maximise Q
                 const { dState, dAction } = this.ddpg.criticBackward(dQ, false);
-                const dFeaturesActor = this.ddpg.policyBackward(dAction, true);
 
-                // dL/dh = gain * (-dQ/ds (direct) + path through actor)
-                const dHidden = hidden.map((_, i) => gain * (-dState[i] + dFeaturesActor[i]));
-                this.lstm.backward(dHidden);
+                // Anchor the policy to the behavior-cloned actor.
+                let dVector = dAction;
+                if (this.anchorActor) {
+                    const anchorVector = this.anchorActor.actorForward(features);
+                    dVector = dAction.map((value, i) =>
+                        value + 2 * this.config.bcAnchor * (actionVector[i] - anchorVector[i]) / N
+                    );
+                }
+
+                const dFeaturesActor = this.ddpg.policyBackward(dVector, true);
+                if (!this.freezeEncoder) {
+                    // dL/dh = gain * (-dQ/ds (direct) + path through actor)
+                    const dHidden = hidden.map((_, i) => gain * (-dState[i] + dFeaturesActor[i]));
+                    this.lstm.backward(dHidden);
+                }
             } catch (error) {
                 console.error('Actor step error:', error.message);
             }
@@ -757,8 +798,10 @@ export class TradingSystem {
         this.actorOptimizer.step(this.ddpg.actorParameters(), this.ddpg.actorGradients());
         this.ddpg.zeroActorGrad();
 
-        this.encoderOptimizer.step(this.lstm.parameters(), this.lstm.gradients());
-        this.lstm.zeroGrad();
+        if (!this.freezeEncoder) {
+            this.encoderOptimizer.step(this.lstm.parameters(), this.lstm.gradients());
+            this.lstm.zeroGrad();
+        }
 
         this.updateTargetNetworks(this.tau);
 
@@ -784,6 +827,12 @@ export class TradingSystem {
                 barsPredicted: this.barsPredicted,
                 rangeWindow: this.config.rangeWindow,
                 dataPoints: this.config.dataPoints,
+                trainFraction: this.config.trainFraction,
+                testEndFraction: this.config.testEndFraction,
+                trainEnd: this.trainEnd,
+                embargo: this.embargo,
+                freezeEncoder: this.freezeEncoder,
+                bcAnchor: this.config.bcAnchor,
                 testStart: this.testStart,
                 stateGain: this.stateGain,
                 seed: this.config.seed,
@@ -890,6 +939,8 @@ async function main() {
     if (args['no-bc']) config.bcEpochs = 0;
     if (args.teacher) config.teacherFeature = String(args.teacher);
     if (args['teacher-sign'] !== undefined) config.teacherSign = Number(args['teacher-sign']);
+    if (args['bc-anchor'] !== undefined) config.bcAnchor = Number(args['bc-anchor']);
+    if (args['no-freeze-encoder']) config.freezeEncoderAfterBc = false;
     if (args['actor-lr']) config.actorLr = Number(args['actor-lr']);
     if (args['critic-lr']) config.criticLr = Number(args['critic-lr']);
     if (args['encoder-lr']) config.encoderLr = Number(args['encoder-lr']);

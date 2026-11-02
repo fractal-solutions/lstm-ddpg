@@ -87,10 +87,37 @@ function formatNumber(value, digits = 3) {
     return value.toFixed(digits);
 }
 
+async function ensembleAction(traders, index) {
+    const vectors = [];
+    for (const t of traders) {
+        const state = await t.dataProcessor.getState(index);
+        vectors.push(t.predict(state, false, true).actionVector);
+    }
+    const average = [0, 0, 0, 0];
+    for (const vector of vectors) {
+        for (let i = 0; i < average.length; i++) average[i] += vector[i] / vectors.length;
+    }
+    const [direction, size, stopLossFrac, takeProfitFrac] = average;
+    let positionSize = direction * size;
+    if (Math.abs(positionSize) < 0.02) positionSize = 0;
+    else positionSize = Number(positionSize.toFixed(2));
+    return {
+        positionSize,
+        direction: Math.sign(positionSize),
+        size: Math.abs(positionSize),
+        stopLossFrac,
+        takeProfitFrac,
+        actionVector: average
+    };
+}
+
 async function run() {
     const args = parseArgs(process.argv.slice(2));
     const modelName = typeof args.model === 'string' ? args.model : 'final_model';
     const useRandom = args.random === true;
+    const ensembleNames = typeof args.ensemble === 'string'
+        ? args.ensemble.split(',').map(name => name.trim()).filter(Boolean)
+        : null;
     const foldCount = Math.max(1, Number(args.folds ?? 1));
     const config = resolveConfig(args);
     if (args.seed !== undefined) {
@@ -101,9 +128,24 @@ async function run() {
     const trader = new TradingSystem(config);
     await trader.loadData();
 
+    let ensemble = null;
+
+    if (useRandom && ensembleNames) {
+        throw new Error('Use either --random or --ensemble, not both');
+    }
+
     if (useRandom) {
         const gain = await trader.calibrateStateGain();
         console.log(`No model loaded: using randomly initialized networks (stateGain=${gain.toFixed(3)}).`);
+    } else if (ensembleNames) {
+        ensemble = [];
+        for (const name of ensembleNames) {
+            const member = new TradingSystem(config);
+            await member.loadData();
+            await member.loadModels(name);
+            ensemble.push(member);
+        }
+        console.log(`Loaded ensemble of ${ensemble.length}: ${ensembleNames.join(', ')}`);
     } else {
         const modelData = await trader.loadModels(modelName);
         console.log(`Loaded model "${modelName}"`);
@@ -115,7 +157,7 @@ async function run() {
 
     const dp = trader.dataProcessor;
     const start = Math.max(trader.testStart, dp.stateStart + 1);
-    const last = dp.normalized.length - trader.barsPredicted;
+    const last = Math.min(dp.normalized.length - trader.barsPredicted, trader.testEnd - 1);
     const maxTrades = Number.isFinite(Number(args.trades)) ? Number(args.trades) : Infinity;
 
     let flatWindows = 0;
@@ -133,7 +175,7 @@ async function run() {
             continue;
         }
 
-        const action = trader.predict(state, false, true);
+        const action = ensemble ? await ensembleAction(ensemble, index) : trader.predict(state, false, true);
         if (action.positionSize === 0) {
             flatWindows++;
             continue;
@@ -178,7 +220,8 @@ async function run() {
     const cagr = equity > 0 ? Math.pow(equity, barsPerYear / barsInTest) - 1 : -1;
 
     console.log('\n=== BACKTEST ===');
-    console.log(formatRow('Model', useRandom ? 'random-init' : modelName));
+    const displayName = useRandom ? 'random-init' : (ensemble ? `ensemble(${ensembleNames.length})` : modelName);
+    console.log(formatRow('Model', displayName));
     console.log(formatRow('Test bars', `${barsInTest} (${start}..${last}, ~${years.toFixed(2)}y)`));
     console.log(formatRow('Spread cost/trade', `${trader.spreadPrice.toExponential(2)} price`));
     console.log(formatRow('Trades', `${stats.trades} (long ${stats.longs} / short ${stats.shorts})`));
@@ -219,7 +262,7 @@ async function run() {
 
     if (!args['no-csv']) {
         await mkdir(RESULTS_DIR, { recursive: true });
-        const tag = useRandom ? 'random' : modelName.replace(/[^a-zA-Z0-9_-]/g, '_');
+        const tag = useRandom ? 'random' : (ensemble ? 'ensemble' : modelName.replace(/[^a-zA-Z0-9_-]/g, '_'));
 
         const csvHeader = 'index,direction,size,entry,stopLoss,takeProfit,slMultiple,tpMultiple,exit,exitIndex,reason,barsHeld,pnlPct,pnlR,netR,netPnl';
         const csvRows = trades.map(t => [
@@ -230,7 +273,7 @@ async function run() {
         await Bun.write(join(RESULTS_DIR, `${tag}_trades.csv`), [csvHeader, ...csvRows].join('\n'));
 
         const summary = {
-            model: useRandom ? 'random-init' : modelName,
+            model: useRandom ? 'random-init' : (ensemble ? ensembleNames.join(',') : modelName),
             test: { start, last, bars: barsInTest, years, startPrice, endPrice },
             spreadPrice: trader.spreadPrice,
             skippedFlatWindows: flatWindows,

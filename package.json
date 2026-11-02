@@ -7,6 +7,7 @@
     "backtest": "bun run backtest.js",
     "gradcheck": "bun run gradcheck.js",
     "sweep": "bun run sweep.js",
+    "walkforward": "bun run walkforward.js",
     "audit": "bun run signalAudit.js"
   },
   "devDependencies": {
