@@ -2,6 +2,12 @@
   "name": "lstm-ddpg",
   "module": "main.js",
   "type": "module",
+  "scripts": {
+    "train": "bun run main.js",
+    "backtest": "bun run backtest.js",
+    "gradcheck": "bun run gradcheck.js",
+    "sweep": "bun run sweep.js"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

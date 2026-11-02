@@ -1,72 +1,143 @@
-export class DataProcessor {
-    constructor(data) {
-      this.data = data;
-      this.lookback = 60; // Previous days for range calculation
-      this.dataPoints = 4000;
-      this.features = ['open', 'high', 'low', 'close', 'volume'];
-      this.normalized;
-      this.combined;
+import { clamp } from './rng.js';
 
+export class DataProcessor {
+    constructor(data, { lookback = 60, dataPoints = 4000 } = {}) {
+        this.data = data;
+        this.lookback = lookback;
+        this.dataPoints = dataPoints;
+        this.features = ['open', 'high', 'low', 'close', 'volume'];
+        this.normalized = null;
+        this.combined = null;
+        this.priceScale = { min: 0, max: 1 };
+        this.volumeScale = { min: 0, max: 1 };
+        this.featureMatrix = null;
+        this.featureStats = null;
     }
 
-    minMaxNormalize(array) {
-        //slice array according to required data points before normalizing
-        let min = Math.min(...this.data.low.slice(-this.dataPoints));
-        let max = Math.max(...this.data.high.slice(-this.dataPoints));
-        // Handle edge case where min equals max
-        if (min === max) {
-            return array.slice(-this.dataPoints).map(() => 0.5); // Return mid-point
+    setScales() {
+        const start = -this.dataPoints;
+        this.priceScale = {
+            min: Math.min(...this.data.low.slice(start)),
+            max: Math.max(...this.data.high.slice(start))
+        };
+        this.volumeScale = {
+            min: Math.min(...this.data.volume.slice(start)),
+            max: Math.max(...this.data.volume.slice(start))
+        };
+    }
+
+    minMaxNormalize(array, { min, max } = this.priceScale) {
+        const window = array.slice(-this.dataPoints);
+        if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
+            return window.map(() => 0.5);
         }
-        return array.slice(-this.dataPoints).map(value => (value - min) / (max - min));
+        return window.map(value => (value - min) / (max - min));
+    }
+
+    toPrice(normalizedValue) {
+        const { min, max } = this.priceScale;
+        return normalizedValue * (max - min) + min;
+    }
+
+    getBar(index) {
+        const bar = this.normalized[index];
+        if (!bar) return null;
+        return {
+            open: this.toPrice(bar[0]),
+            high: this.toPrice(bar[1]),
+            low: this.toPrice(bar[2]),
+            close: this.toPrice(bar[3])
+        };
     }
 
     combineData(normalizedData) {
         const { open, high, low, close, volume } = normalizedData;
-        //console.log(normalizedData);
         this.combined = open.map((_, i) => [open[i], high[i], low[i], close[i], volume[i]]);
-        return this.combined
+        return this.combined;
     }
-  
-    normalizeData(dataPoints = 4000) {
+
+    normalizeData(dataPoints = this.dataPoints) {
         this.dataPoints = dataPoints;
+        this.setScales();
         this.normalized = this.combineData({
-            open: this.minMaxNormalize(this.data.open),
-            high: this.minMaxNormalize(this.data.high),
-            low: this.minMaxNormalize(this.data.low),
-            close: this.minMaxNormalize(this.data.close),
-            volume: this.minMaxNormalize(this.data.volume)
+            open: this.minMaxNormalize(this.data.open, this.priceScale),
+            high: this.minMaxNormalize(this.data.high, this.priceScale),
+            low: this.minMaxNormalize(this.data.low, this.priceScale),
+            close: this.minMaxNormalize(this.data.close, this.priceScale),
+            volume: this.minMaxNormalize(this.data.volume, this.volumeScale)
         });
-        
-        //console.log(normalized2);
         return this.normalized;
     }
-  
-    calculateRange(window) {
-      //console.log(window);
-      //const highs = window.map(d => d.high);
-      //const lows = window.map(d => d.low);
-      if (window)return Math.max(...window) - Math.min(...window);
-      else return 0;
+
+    /**
+     * Builds the model input: per-bar log return + relative range, standardized
+     * with statistics from the training region only (no test leakage).
+     */
+    buildFeatures(trainEnd) {
+        const n = this.normalized.length;
+        const raw = new Array(n);
+
+        for (let i = 0; i < n; i++) {
+            const bar = this.getBar(i);
+            const prevClose = i > 0 ? this.getBar(i - 1).close : bar.close;
+            const logReturn = i > 0 ? Math.log(bar.close / prevClose) : 0;
+            const relativeRange = bar.close > 0 ? (bar.high - bar.low) / bar.close : 0;
+            raw[i] = [logReturn, relativeRange];
+        }
+
+        const end = Math.max(2, Math.min(trainEnd ?? n, n));
+        const means = [0, 0];
+        for (let i = 0; i < end; i++) {
+            means[0] += raw[i][0];
+            means[1] += raw[i][1];
+        }
+        means[0] /= end;
+        means[1] /= end;
+
+        const variances = [0, 0];
+        for (let i = 0; i < end; i++) {
+            variances[0] += (raw[i][0] - means[0]) ** 2;
+            variances[1] += (raw[i][1] - means[1]) ** 2;
+        }
+        const stds = [
+            Math.sqrt(variances[0] / end) || 1e-8,
+            Math.sqrt(variances[1] / end) || 1e-8
+        ];
+
+        this.featureStats = { means, stds, trainEnd: end };
+        this.featureMatrix = raw.map(([logReturn, relativeRange]) => [
+            clamp((logReturn - means[0]) / stds[0], -5, 5),
+            clamp((relativeRange - means[1]) / stds[1], -5, 5)
+        ]);
+
+        return this.featureMatrix;
     }
-  
-    calculateVolumeMA(window) {
-      const volumes = window.map(d => d.volume);
-      return volumes.reduce((a, b) => a + b, 0) / window.length;
-    }
-  
-    async getState(index) {
-        //const normalized = this.normalizeData();
-        // Ensure index is within bounds
-        if (index < this.lookback + 5 || index >= this.normalized.length - this.lookback - 5 ) {
+
+    getState(index) {
+        if (!this.featureMatrix) {
+            throw new Error('Features not built. Call buildFeatures() first.');
+        }
+        if (index < this.lookback || index > this.featureMatrix.length) {
             throw new Error(`Index ${index} out of bounds`);
         }
-        const sliced = this.normalized.slice(Math.max(0, index - this.lookback), index);
-        let closePrices = [];
-        
-        for (let i = 0; i < this.lookback; i++) {
-            closePrices.push(sliced[i][3]);
-        }
-        //console.log(closePrices);
-        return closePrices;
+        return this.featureMatrix.slice(index - this.lookback, index);
     }
-  }
+
+    /** Actual (non-normalized) high-low range over `window` bars ending at index-1. */
+    priceRangeAt(index, window = this.lookback) {
+        let high = -Infinity;
+        let low = Infinity;
+        for (let i = index - window; i < index; i++) {
+            const bar = this.getBar(i);
+            if (!bar) continue;
+            if (bar.high > high) high = bar.high;
+            if (bar.low < low) low = bar.low;
+        }
+        return Number.isFinite(high) && Number.isFinite(low) ? high - low : 0;
+    }
+
+    calculateRange(window) {
+        if (!Array.isArray(window) || window.length === 0) return 0;
+        return Math.max(...window) - Math.min(...window);
+    }
+}
