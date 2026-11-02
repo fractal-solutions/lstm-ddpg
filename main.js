@@ -9,11 +9,18 @@ const ROOT = import.meta.dir;
 
 export const DEFAULT_CONFIG = {
     lookback: 60,
-    featureSize: 2,         // [log return, relative range] per bar
+    // Audited causal features (see signalAudit.js / README)
+    featureNames: [
+        'ret1z', 'ret5z', 'ret20z', 'ret60z',
+        'atrRel', 'volRatio',
+        'dist20', 'dist50', 'slope20',
+        'donchian20', 'rsi14', 'bollingerB'
+    ],
     hiddenSize: 32,
     actionSize: 4,          // [direction, size, SL fraction, TP fraction]
-    barsPredicted: 5,
-    rangeWindow: 10,          // bars used for the volatility-based SL/TP distance
+    barsPredicted: 20,
+    rangeWindow: 20,        // bars used for the volatility-based SL/TP distance
+    dataPoints: null,       // null => use the full file
     gamma: 0.99,
     tau: 0.001,
     flatPenalty: 0.01,      // small cost for staying flat so it is not a free escape
@@ -29,6 +36,13 @@ export const DEFAULT_CONFIG = {
     pretrainEpochs: 3,
     pretrainStepsPerEpoch: 50,
     pretrainBatchSize: 16,
+    // Supervised actor initialization (behavior cloning) from the audit signal
+    bcEpochs: 5,
+    bcStepsPerEpoch: 50,
+    bcBatchSize: 16,
+    bcLr: 1e-3,
+    teacherFeature: 'ret1z',
+    teacherSign: -1,        // -1 = contrarian, +1 = momentum
     // Fine-tuning the pretrained encoder slowly avoids destroying it.
     encoderLr: 1e-4,
     actorLr: 1e-3,
@@ -50,6 +64,30 @@ export const DEFAULT_CONFIG = {
     dataPath: join(ROOT, 'data', 'EURUSD_D1.json'),
     modelDir: join(ROOT, 'saved_models')
 };
+
+// Horizon-matched profiles: ~20 trading days per timeframe.
+export const TIMEFRAMES = {
+    D1: { dataPath: join(ROOT, 'data', 'EURUSD_D1.json'), barsPredicted: 20, rangeWindow: 20, teacherFeature: 'ret1z' },
+    H4: { dataPath: join(ROOT, 'data', 'EURUSD_H4.json'), barsPredicted: 120, rangeWindow: 60, teacherFeature: 'bollingerB' },
+    H1: { dataPath: join(ROOT, 'data', 'EURUSD_H1.json'), barsPredicted: 480, rangeWindow: 240, teacherFeature: 'ret20z' }
+};
+
+export function resolveConfig(args = {}) {
+    const config = { ...DEFAULT_CONFIG };
+    const timeframe = typeof args.tf === 'string' ? args.tf.toUpperCase() : null;
+    if (timeframe) {
+        const profile = TIMEFRAMES[timeframe];
+        if (!profile) throw new Error(`Unknown timeframe "${args.tf}" (use D1, H4, or H1)`);
+        Object.assign(config, profile);
+        config.timeframe = timeframe;
+    }
+    if (args.data) config.dataPath = args.data;
+    if (args.bars) config.barsPredicted = Number(args.bars);
+    if (args['range-window']) config.rangeWindow = Number(args['range-window']);
+    if (args['data-points']) config.dataPoints = Number(args['data-points']);
+    if (args.features) config.featureNames = String(args.features).split(',');
+    return config;
+}
 
 export class ReplayBuffer {
     constructor(maxSize = 100000) {
@@ -77,9 +115,10 @@ export class TradingSystem {
         this.config = { ...DEFAULT_CONFIG, ...config };
         const cfg = this.config;
 
-        this.lstm = new LSTM(cfg.featureSize, cfg.hiddenSize);
+        const featureSize = cfg.featureNames.length;
+        this.lstm = new LSTM(featureSize, cfg.hiddenSize);
         this.ddpg = new DDPG(cfg.hiddenSize, cfg.actionSize);
-        this.targetLstm = new LSTM(cfg.featureSize, cfg.hiddenSize);
+        this.targetLstm = new LSTM(featureSize, cfg.hiddenSize);
         this.targetDdpg = new DDPG(cfg.hiddenSize, cfg.actionSize);
 
         this.replayBuffer = new ReplayBuffer(cfg.replaySize);
@@ -92,6 +131,7 @@ export class TradingSystem {
         this.actorOptimizer = new Adam({ lr: cfg.actorLr, clipNorm: cfg.clipNorm });
         this.criticOptimizer = new Adam({ lr: cfg.criticLr, clipNorm: cfg.clipNorm });
         this.pretrainOptimizer = new Adam({ lr: cfg.pretrainLr, clipNorm: 5 });
+        this.bcOptimizer = new Adam({ lr: cfg.bcLr, clipNorm: cfg.clipNorm });
 
         this.encoderHead = null;
         this.stateGain = 1;
@@ -111,10 +151,13 @@ export class TradingSystem {
 
     async loadData(path = this.config.dataPath) {
         const data = await Bun.file(path).json();
-        this.dataProcessor = new DataProcessor(data, { lookback: this.config.lookback });
-        this.dataProcessor.normalizeData();
+        this.dataProcessor = new DataProcessor(data, {
+            lookback: this.config.lookback,
+            dataPoints: this.config.dataPoints
+        });
+        this.dataProcessor.normalizeData(this.config.dataPoints ?? data.close.length);
         this.initializeSplit();
-        this.dataProcessor.buildFeatures(this.testStart);
+        this.dataProcessor.buildFeatures(this.testStart, this.config.featureNames);
 
         const point = Number.isFinite(data.point) ? data.point : 0.00001;
         const spreadPoints = this.config.spreadPoints ?? (Number.isFinite(data.spread) ? data.spread : 0);
@@ -134,7 +177,7 @@ export class TradingSystem {
 
     get trainRange() {
         return {
-            min: this.dataProcessor.lookback,
+            min: this.dataProcessor.stateStart,
             max: this.testStart - this.barsPredicted
         };
     }
@@ -158,8 +201,8 @@ export class TradingSystem {
             throw new Error(`State must be an array of length ${this.inputSize}, received ${Array.isArray(state) ? state.length : typeof state}`);
         }
         for (const bar of state) {
-            if (!Array.isArray(bar) || bar.length !== this.config.featureSize) {
-                throw new Error(`Each state bar must have ${this.config.featureSize} features`);
+            if (!Array.isArray(bar) || bar.length !== this.config.featureNames.length) {
+                throw new Error(`Each state bar must have ${this.config.featureNames.length} features`);
             }
             if (bar.some(value => !Number.isFinite(value))) {
                 throw new Error('Invalid state values detected');
@@ -397,6 +440,87 @@ export class TradingSystem {
         console.log(`State gain calibrated to ${this.stateGain.toFixed(3)}`);
     }
 
+    async behaviorClone({ epochs = this.config.bcEpochs, steps = this.config.bcStepsPerEpoch } = {}) {
+        if (epochs <= 0) return;
+
+        const teacherIndex = this.config.featureNames.indexOf(this.config.teacherFeature);
+        if (teacherIndex === -1) {
+            throw new Error(`Teacher feature "${this.config.teacherFeature}" is not in the feature set`);
+        }
+
+        const { min, max } = this.trainRange;
+        const batchSize = this.config.bcBatchSize;
+        const sign = this.config.teacherSign;
+
+        console.log(`Behavior cloning actor (${epochs} epochs x ${steps} steps), teacher=${this.config.teacherFeature} sign=${sign}`);
+
+        for (let epoch = 0; epoch < epochs; epoch++) {
+            let correct = 0;
+            let total = 0;
+            let squaredError = 0;
+
+            for (let step = 0; step < steps; step++) {
+                this.ddpg.zeroActorGrad();
+                let used = 0;
+
+                for (let b = 0; b < batchSize; b++) {
+                    const index = min + 1 + Math.floor(Math.random() * (max - min));
+                    try {
+                        const state = await this.dataProcessor.getState(index);
+                        const teacherValue = state[state.length - 1][teacherIndex];
+                        const target = sign * Math.sign(teacherValue);
+                        if (target === 0) continue;
+
+                        const policy = this.ddpg.policyForward(this.encode(state));
+                        const predicted = policy.direction;
+
+                        if (Math.sign(predicted) === target) correct++;
+                        squaredError += (predicted - target) ** 2;
+                        total++;
+
+                        const dDirection = (predicted - target) / batchSize;
+                        this.ddpg.policyBackward([dDirection, 0, 0, 0], true);
+                        used++;
+                    } catch {
+                        continue;
+                    }
+                }
+
+                if (used === 0) continue;
+                this.bcOptimizer.step(this.ddpg.actorParameters(), this.ddpg.actorGradients());
+            }
+
+            const accuracy = total > 0 ? correct / total : 0;
+            const mse = total > 0 ? squaredError / total : 0;
+            console.log(`[bc ${epoch + 1}/${epochs}] teacherAcc=${(accuracy * 100).toFixed(1)}% mse=${mse.toFixed(4)}`);
+        }
+
+        const evaluation = await this.evaluateTeacher();
+        console.log(`Behavior-clone validation: teacherAcc=${(evaluation.accuracy * 100).toFixed(1)}% over ${evaluation.total} windows`);
+    }
+
+    async evaluateTeacher(steps = this.config.validationSteps) {
+        const teacherIndex = this.config.featureNames.indexOf(this.config.teacherFeature);
+        const sign = this.config.teacherSign;
+        let correct = 0;
+        let total = 0;
+
+        for (const index of this.getValidationIndices(steps)) {
+            try {
+                const state = await this.dataProcessor.getState(index);
+                const target = sign * Math.sign(state[state.length - 1][teacherIndex]);
+                if (target === 0) continue;
+                const policy = this.ddpg.policyForward(this.encode(state));
+                if (Math.sign(policy.direction) === target) correct++;
+                total++;
+            } catch {
+                continue;
+            }
+        }
+
+        return { accuracy: total > 0 ? correct / total : 0, total };
+    }
+
     async validate(steps = this.config.validationSteps) {
         let sumR = 0;
         let sumPnl = 0;
@@ -431,8 +555,9 @@ export class TradingSystem {
         }
 
         const avgR = trades > 0 ? sumR / trades : 0;
+        // Expectancy is the objective; drawdown is only a light tie-breaker.
         const score = trades >= this.config.minValidationTrades
-            ? avgR - Math.abs(maxDrawdown)
+            ? avgR - 0.1 * Math.abs(maxDrawdown)
             : -Infinity;
 
         return {
@@ -453,13 +578,21 @@ export class TradingSystem {
         const { min, max } = this.trainRange;
         console.log(`Loaded ${this.dataProcessor.data.close.length} bars (normalized ${this.dataProcessor.normalized.length})`);
         console.log(`Train index range [${min}, ${max}], test starts at ${this.testStart}`);
-        console.log(`Features: ${this.config.featureSize}, spread cost: ${this.spreadPrice.toExponential(2)}`);
+        console.log(`Features: ${this.config.featureNames.length} (${this.config.featureNames.join(',')})`);
+        console.log(`Horizon: ${this.barsPredicted} bars, range window: ${this.config.rangeWindow}, spread cost: ${this.spreadPrice.toExponential(2)}`);
 
         const didPretrain = this.config.pretrainEpochs > 0;
         await this.pretrain();
 
         if (save && didPretrain) {
             await this.saveModels(modelName('pretrain_model'), { stage: 'pretrain' });
+        }
+
+        if (this.config.bcEpochs > 0) {
+            await this.behaviorClone();
+            if (save) {
+                await this.saveModels(modelName('bc_model'), { stage: 'behavior-clone' });
+            }
         }
 
         console.log(`Training DDPG ${epochs} epochs x ${stepsPerEpoch} steps, batch ${this.batchSize}`);
@@ -643,11 +776,14 @@ export class TradingSystem {
             ddpg: this.ddpg.toJSON(),
             meta: {
                 savedAt: new Date().toISOString(),
+                timeframe: this.config.timeframe ?? null,
                 lookback: this.config.lookback,
-                featureSize: this.config.featureSize,
+                featureNames: this.config.featureNames,
                 hiddenSize: this.config.hiddenSize,
                 actionSize: this.config.actionSize,
                 barsPredicted: this.barsPredicted,
+                rangeWindow: this.config.rangeWindow,
+                dataPoints: this.config.dataPoints,
                 testStart: this.testStart,
                 stateGain: this.stateGain,
                 seed: this.config.seed,
@@ -663,15 +799,33 @@ export class TradingSystem {
         const path = join(this.config.modelDir, `${filename}.json`);
         const modelData = await Bun.file(path).json();
 
-        if (modelData.lstm.inputSize !== this.config.featureSize) {
+        if (modelData.lstm.inputSize !== this.config.featureNames.length) {
             throw new Error(
                 `Checkpoint "${filename}" expects ${modelData.lstm.inputSize} features per bar, ` +
-                `config uses ${this.config.featureSize}. Retrain with the current code.`
+                `config uses ${this.config.featureNames.length}. Retrain for this feature set.`
+            );
+        }
+        if (modelData.meta?.featureNames && modelData.meta.featureNames.join(',') !== this.config.featureNames.join(',')) {
+            throw new Error(
+                `Checkpoint "${filename}" uses a different feature set. ` +
+                `Pass the matching --tf/--features or retrain.`
             );
         }
         if (modelData.meta?.lookback && modelData.meta.lookback !== this.config.lookback) {
             throw new Error(
                 `Checkpoint "${filename}" expects lookback=${modelData.meta.lookback}, config uses ${this.config.lookback}.`
+            );
+        }
+        if (modelData.meta?.barsPredicted && modelData.meta.barsPredicted !== this.barsPredicted) {
+            throw new Error(
+                `Checkpoint "${filename}" expects barsPredicted=${modelData.meta.barsPredicted}, ` +
+                `config uses ${this.barsPredicted}. Pass the matching --tf/--bars.`
+            );
+        }
+        if (modelData.meta?.rangeWindow && modelData.meta.rangeWindow !== this.config.rangeWindow) {
+            throw new Error(
+                `Checkpoint "${filename}" expects rangeWindow=${modelData.meta.rangeWindow}, ` +
+                `config uses ${this.config.rangeWindow}. Pass the matching --tf/--range-window.`
             );
         }
         if (modelData.ddpg.stateSize !== this.config.hiddenSize || modelData.ddpg.actionSize !== this.config.actionSize) {
@@ -723,7 +877,7 @@ function parseArgs(argv) {
 
 async function main() {
     const args = parseArgs(process.argv.slice(2));
-    const config = { ...DEFAULT_CONFIG };
+    const config = resolveConfig(args);
     if (args.epochs) config.epochs = Number(args.epochs);
     if (args.steps) config.stepsPerEpoch = Number(args.steps);
     if (args.batch) config.batchSize = Number(args.batch);
@@ -731,7 +885,11 @@ async function main() {
     if (args['pretrain-epochs'] !== undefined) config.pretrainEpochs = Number(args['pretrain-epochs']);
     if (args['pretrain-steps'] !== undefined) config.pretrainStepsPerEpoch = Number(args['pretrain-steps']);
     if (args['no-pretrain']) config.pretrainEpochs = 0;
-    if (args.data) config.dataPath = args.data;
+    if (args['bc-epochs'] !== undefined) config.bcEpochs = Number(args['bc-epochs']);
+    if (args['bc-steps'] !== undefined) config.bcStepsPerEpoch = Number(args['bc-steps']);
+    if (args['no-bc']) config.bcEpochs = 0;
+    if (args.teacher) config.teacherFeature = String(args.teacher);
+    if (args['teacher-sign'] !== undefined) config.teacherSign = Number(args['teacher-sign']);
     if (args['actor-lr']) config.actorLr = Number(args['actor-lr']);
     if (args['critic-lr']) config.criticLr = Number(args['critic-lr']);
     if (args['encoder-lr']) config.encoderLr = Number(args['encoder-lr']);
@@ -739,7 +897,6 @@ async function main() {
     if (args.sigma) config.noiseSigma = Number(args.sigma);
     if (args['min-sigma']) config.minNoiseSigma = Number(args['min-sigma']);
     if (args['noise-decay']) config.noiseDecay = Number(args['noise-decay']);
-    if (args['range-window']) config.rangeWindow = Number(args['range-window']);
     if (args.gamma) config.gamma = Number(args.gamma);
     if (args.seed !== undefined) {
         config.seed = Number(args.seed);

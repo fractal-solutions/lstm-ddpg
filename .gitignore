@@ -176,3 +176,6 @@ dist
 
 # Backtest output
 backtest_results/
+
+# Signal audit output
+signal_audit/

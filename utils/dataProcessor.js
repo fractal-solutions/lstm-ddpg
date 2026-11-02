@@ -1,7 +1,8 @@
 import { clamp } from './rng.js';
+import { buildFeatureMatrix } from './features.js';
 
 export class DataProcessor {
-    constructor(data, { lookback = 60, dataPoints = 4000 } = {}) {
+    constructor(data, { lookback = 60, dataPoints = null } = {}) {
         this.data = data;
         this.lookback = lookback;
         this.dataPoints = dataPoints;
@@ -11,23 +12,31 @@ export class DataProcessor {
         this.priceScale = { min: 0, max: 1 };
         this.volumeScale = { min: 0, max: 1 };
         this.featureMatrix = null;
+        this.featureNames = null;
         this.featureStats = null;
+        this.warmup = 60;
+        this.stateStart = lookback + 60;
     }
 
     setScales() {
-        const start = -this.dataPoints;
-        this.priceScale = {
-            min: Math.min(...this.data.low.slice(start)),
-            max: Math.max(...this.data.high.slice(start))
-        };
-        this.volumeScale = {
-            min: Math.min(...this.data.volume.slice(start)),
-            max: Math.max(...this.data.volume.slice(start))
-        };
+        const n = this.data.close.length;
+        const start = Math.max(0, n - this.dataPoints);
+        let low = Infinity;
+        let high = -Infinity;
+        let volLow = Infinity;
+        let volHigh = -Infinity;
+        for (let i = start; i < n; i++) {
+            if (this.data.low[i] < low) low = this.data.low[i];
+            if (this.data.high[i] > high) high = this.data.high[i];
+            if (this.data.volume[i] < volLow) volLow = this.data.volume[i];
+            if (this.data.volume[i] > volHigh) volHigh = this.data.volume[i];
+        }
+        this.priceScale = { min: low, max: high };
+        this.volumeScale = { min: volLow, max: volHigh };
     }
 
     minMaxNormalize(array, { min, max } = this.priceScale) {
-        const window = array.slice(-this.dataPoints);
+        const window = this.dataPoints >= array.length ? array : array.slice(-this.dataPoints);
         if (!Number.isFinite(min) || !Number.isFinite(max) || min === max) {
             return window.map(() => 0.5);
         }
@@ -57,7 +66,7 @@ export class DataProcessor {
     }
 
     normalizeData(dataPoints = this.dataPoints) {
-        this.dataPoints = dataPoints;
+        this.dataPoints = dataPoints ?? this.data.close.length;
         this.setScales();
         this.normalized = this.combineData({
             open: this.minMaxNormalize(this.data.open, this.priceScale),
@@ -70,45 +79,49 @@ export class DataProcessor {
     }
 
     /**
-     * Builds the model input: per-bar log return + relative range, standardized
-     * with statistics from the training region only (no test leakage).
+     * Builds standardized model inputs from the audited causal feature set.
+     * Feature statistics come from the training region only.
      */
-    buildFeatures(trainEnd) {
-        const n = this.normalized.length;
-        const raw = new Array(n);
+    buildFeatures(trainEnd, featureNames) {
+        const { matrix: full, featureNames: allNames, warmup } = buildFeatureMatrix(this.data);
+        this.warmup = warmup;
+        this.stateStart = warmup + this.lookback;
+        this.featureNames = featureNames;
 
-        for (let i = 0; i < n; i++) {
-            const bar = this.getBar(i);
-            const prevClose = i > 0 ? this.getBar(i - 1).close : bar.close;
-            const logReturn = i > 0 ? Math.log(bar.close / prevClose) : 0;
-            const relativeRange = bar.close > 0 ? (bar.high - bar.low) / bar.close : 0;
-            raw[i] = [logReturn, relativeRange];
+        const indices = featureNames.map(name => {
+            const index = allNames.indexOf(name);
+            if (index === -1) throw new Error(`Unknown feature "${name}"`);
+            return index;
+        });
+
+        const end = Math.max(warmup + 2, Math.min(trainEnd, full.length));
+        const means = new Array(featureNames.length).fill(0);
+        const stds = new Array(featureNames.length).fill(0);
+        let count = 0;
+        for (let i = warmup; i < end; i++) {
+            for (let f = 0; f < indices.length; f++) means[f] += full[i][indices[f]];
+            count++;
         }
-
-        const end = Math.max(2, Math.min(trainEnd ?? n, n));
-        const means = [0, 0];
-        for (let i = 0; i < end; i++) {
-            means[0] += raw[i][0];
-            means[1] += raw[i][1];
+        if (count === 0) throw new Error('Not enough bars to build features');
+        for (let f = 0; f < means.length; f++) means[f] /= count;
+        for (let i = warmup; i < end; i++) {
+            for (let f = 0; f < indices.length; f++) {
+                stds[f] += (full[i][indices[f]] - means[f]) ** 2;
+            }
         }
-        means[0] /= end;
-        means[1] /= end;
+        for (let f = 0; f < stds.length; f++) stds[f] = Math.sqrt(stds[f] / count) || 1e-8;
 
-        const variances = [0, 0];
-        for (let i = 0; i < end; i++) {
-            variances[0] += (raw[i][0] - means[0]) ** 2;
-            variances[1] += (raw[i][1] - means[1]) ** 2;
+        this.featureStats = { means, stds, warmup, trainEnd: end };
+        this.featureMatrix = new Array(full.length);
+        for (let i = 0; i < full.length; i++) {
+            if (i < warmup) {
+                this.featureMatrix[i] = null;
+                continue;
+            }
+            this.featureMatrix[i] = indices.map((sourceIndex, f) =>
+                clamp((full[i][sourceIndex] - means[f]) / stds[f], -5, 5)
+            );
         }
-        const stds = [
-            Math.sqrt(variances[0] / end) || 1e-8,
-            Math.sqrt(variances[1] / end) || 1e-8
-        ];
-
-        this.featureStats = { means, stds, trainEnd: end };
-        this.featureMatrix = raw.map(([logReturn, relativeRange]) => [
-            clamp((logReturn - means[0]) / stds[0], -5, 5),
-            clamp((relativeRange - means[1]) / stds[1], -5, 5)
-        ]);
 
         return this.featureMatrix;
     }
@@ -117,7 +130,7 @@ export class DataProcessor {
         if (!this.featureMatrix) {
             throw new Error('Features not built. Call buildFeatures() first.');
         }
-        if (index < this.lookback || index > this.featureMatrix.length) {
+        if (index < this.stateStart || index > this.featureMatrix.length) {
             throw new Error(`Index ${index} out of bounds`);
         }
         return this.featureMatrix.slice(index - this.lookback, index);
@@ -134,10 +147,5 @@ export class DataProcessor {
             if (bar.low < low) low = bar.low;
         }
         return Number.isFinite(high) && Number.isFinite(low) ? high - low : 0;
-    }
-
-    calculateRange(window) {
-        if (!Array.isArray(window) || window.length === 0) return 0;
-        return Math.max(...window) - Math.min(...window);
     }
 }

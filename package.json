@@ -6,7 +6,8 @@
     "train": "bun run main.js",
     "backtest": "bun run backtest.js",
     "gradcheck": "bun run gradcheck.js",
-    "sweep": "bun run sweep.js"
+    "sweep": "bun run sweep.js",
+    "audit": "bun run signalAudit.js"
   },
   "devDependencies": {
     "@types/bun": "latest"

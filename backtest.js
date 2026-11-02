@@ -1,6 +1,6 @@
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
-import { DEFAULT_CONFIG, TradingSystem } from './main.js';
+import { resolveConfig, TradingSystem } from './main.js';
 import { setSeed } from './utils/rng.js';
 
 const ROOT = import.meta.dir;
@@ -92,8 +92,7 @@ async function run() {
     const modelName = typeof args.model === 'string' ? args.model : 'final_model';
     const useRandom = args.random === true;
     const foldCount = Math.max(1, Number(args.folds ?? 1));
-    const config = { ...DEFAULT_CONFIG };
-    if (args.data) config.dataPath = args.data;
+    const config = resolveConfig(args);
     if (args.seed !== undefined) {
         config.seed = Number(args.seed);
         setSeed(config.seed);
@@ -109,13 +108,13 @@ async function run() {
         const modelData = await trader.loadModels(modelName);
         console.log(`Loaded model "${modelName}"`);
         if (modelData.meta) {
-            const { savedAt, lookback, featureSize, hiddenSize, barsPredicted, stateGain, seed, epoch, stage } = modelData.meta;
-            console.log(`  meta: saved=${savedAt} lookback=${lookback} features=${featureSize} hidden=${hiddenSize} bars=${barsPredicted} gain=${stateGain?.toFixed?.(3) ?? stateGain} seed=${seed ?? '-'} epoch=${epoch ?? '-'} stage=${stage ?? 'ddpg'}`);
+            const { savedAt, timeframe, lookback, featureNames, hiddenSize, barsPredicted, rangeWindow, stateGain, seed, epoch, stage } = modelData.meta;
+            console.log(`  meta: saved=${savedAt} tf=${timeframe ?? '-'} lookback=${lookback} features=${featureNames?.length ?? '?'} hidden=${hiddenSize} bars=${barsPredicted} range=${rangeWindow} gain=${stateGain?.toFixed?.(3) ?? stateGain} seed=${seed ?? '-'} epoch=${epoch ?? '-'} stage=${stage ?? 'ddpg'}`);
         }
     }
 
     const dp = trader.dataProcessor;
-    const start = Math.max(trader.testStart, dp.lookback + 1);
+    const start = Math.max(trader.testStart, dp.stateStart + 1);
     const last = dp.normalized.length - trader.barsPredicted;
     const maxTrades = Number.isFinite(Number(args.trades)) ? Number(args.trades) : Infinity;
 
@@ -169,12 +168,14 @@ async function run() {
 
     const stats = computeStats(trades);
     const barsInTest = last - (start - 1) + 1;
-    const years = barsInTest / 252;
+    const periodMinutes = Number.isFinite(dp.data.period) ? dp.data.period : 1440;
+    const barsPerYear = 252 * (1440 / periodMinutes);
+    const years = barsInTest / barsPerYear;
     const startPrice = dp.getBar(start - 1).close;
     const endPrice = dp.getBar(last).close;
     const buyHold = endPrice / startPrice - 1;
     const equity = 1 + stats.totalReturn;
-    const cagr = equity > 0 ? Math.pow(equity, 252 / barsInTest) - 1 : -1;
+    const cagr = equity > 0 ? Math.pow(equity, barsPerYear / barsInTest) - 1 : -1;
 
     console.log('\n=== BACKTEST ===');
     console.log(formatRow('Model', useRandom ? 'random-init' : modelName));

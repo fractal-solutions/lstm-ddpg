@@ -11,7 +11,7 @@ function parseArgs(argv) {
         const arg = argv[i];
         if (!arg.startsWith('--')) continue;
         const key = arg.slice(2);
-        if (key === 'no-pretrain') {
+        if (key === 'no-pretrain' || key === 'no-bc') {
             options[key] = true;
             continue;
         }
@@ -52,20 +52,27 @@ const seeds = String(args.seeds ?? '1,2,3').split(',').map(Number).filter(Number
 const folds = Number(args.folds ?? 3);
 
 const trainArgs = ['bun', 'run', 'main.js'];
-for (const key of ['epochs', 'steps', 'batch', 'pretrain-epochs', 'pretrain-steps']) {
+const sharedArgs = [];
+for (const key of ['epochs', 'steps', 'batch', 'pretrain-epochs', 'pretrain-steps', 'bc-epochs', 'bc-steps'])  {
     if (args[key] !== undefined) trainArgs.push(`--${key}`, String(args[key]));
 }
+for (const key of ['tf', 'bars', 'range-window', 'features', 'data', 'teacher', 'teacher-sign']) {
+    if (args[key] !== undefined) sharedArgs.push(`--${key}`, String(args[key]));
+}
 if (args['no-pretrain']) trainArgs.push('--no-pretrain');
+if (args['no-bc']) trainArgs.push('--no-bc');
 
 console.log(`Running ${seeds.length} seeds${args['no-pretrain'] ? ' (no pretrain)' : ''}\n`);
 console.log('seed   trades  dir(L/S)   win%    PF      expR     ret%     maxDD%   folds+');
 
 const rows = [];
+const tfTag = String(args.tf ?? 'D1').toLowerCase();
 for (const seed of seeds) {
-    const prefix = `seed${seed}`;
-    run([...trainArgs, '--seed', String(seed), '--prefix', prefix]);
+    const prefix = `${tfTag}_seed${seed}`;
+    run([...trainArgs, ...sharedArgs, '--seed', String(seed), '--prefix', prefix]);
 
-    const output = run(['bun', 'run', 'backtest.js', '--model', `${prefix}_best_model`, '--no-csv', '--folds', String(folds)]);
+    const modelSuffix = Number(args.epochs) === 0 ? 'bc_model' : 'best_model';
+    const output = run(['bun', 'run', 'backtest.js', '--model', `${prefix}_${modelSuffix}`, '--no-csv', '--folds', String(folds), ...sharedArgs]);
 
     const trades = extract(output, 'Trades');
     const direction = (trades.match(/\(long (\d+) \/ short (\d+)\)/) ?? []).slice(1).join('/');
